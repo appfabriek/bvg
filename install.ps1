@@ -155,11 +155,25 @@ Say "pairing with bvgeert..."
 # can't reach bvgeert on 443 directly but do allow wss://*.webpubsub.azure.com:443.
 $paired = $false
 
+function Invoke-Bvg {
+  param([string[]]$BvgArgs)
+  # Native commands that write to stderr would otherwise be treated as fatal
+  # PowerShell errors under $ErrorActionPreference = "Stop", killing the
+  # script before we can check $LASTEXITCODE or attempt the azure fallback.
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & $ExePath @BvgArgs 2>&1 | ForEach-Object { Write-Host $_ }
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+}
+
 if ($BvgeertHost) {
   Say "  trying direct route via $BvgeertHost..."
   $directArgs = @("join", "--host", $BvgeertHost, "--token", $JoinToken)
   if ($Transport) { $directArgs += @("--transport", $Transport) }
-  & $ExePath @directArgs
+  Invoke-Bvg $directArgs
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via direct route"
@@ -174,7 +188,7 @@ if (-not $paired -and $AzureHub) {
   if (-not $Transport) { Fail "BVG_TRANSPORT is required for azure route" }
   Say "  trying azure route via $AzureHub..."
   $azureArgs = @("join", "--hub", $AzureHub, "--transport", $Transport, "--token", $JoinToken)
-  & $ExePath @azureArgs
+  Invoke-Bvg $azureArgs
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via azure route"
