@@ -52,11 +52,12 @@ if ($existingTask) {
 
 if (-not $KeepFiles -and (Test-Path $InstallDir)) {
   Say "removing $InstallDir..."
-  # credentials.json has its ACL hardened to "SYSTEM:F + Administrators:R" by
-  # install.ps1 — Administrators can't delete it without first restoring
-  # write/delete rights. Grant Administrators full control across the tree
-  # before Remove-Item.
-  try { & icacls.exe $InstallDir /grant "Administrators:(F)" /T /C 2>$null | Out-Null } catch { }
+  # credentials.json is owned by SYSTEM with ACL hardened to "SYSTEM:F +
+  # Administrators:R" by install.ps1, so Remove-Item gets "Access denied".
+  # Take ownership as Administrators, then reset the ACL across the tree
+  # so default ProgramData inheritance gives us full control.
+  try { & takeown.exe /F $InstallDir /R /A /D Y 2>$null | Out-Null } catch { }
+  try { & icacls.exe $InstallDir /reset /T /C 2>$null | Out-Null } catch { }
   Remove-Item -Path $InstallDir -Recurse -Force
 }
 
