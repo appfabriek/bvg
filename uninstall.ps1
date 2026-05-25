@@ -29,6 +29,9 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) { Fail "uninstall must run elevated" }
 
+$ExePath = Join-Path $InstallDir "bvg.exe"
+$CredsPath = Join-Path $InstallDir "credentials.json"
+
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($svc) {
   if ($svc.Status -eq "Running") {
@@ -41,6 +44,20 @@ if ($svc) {
   Start-Sleep -Seconds 1
 } else {
   Say "service '$ServiceName' not registered, skipping"
+}
+
+# Tell bvgeert we're leaving so the Transport::Client record gets disabled.
+# Best-effort: if the network's down or the token's expired, we still
+# continue with the local cleanup.
+if ((Test-Path $ExePath) -and (Test-Path $CredsPath)) {
+  Say "deregistering from bvgeert..."
+  $env:BVG_CREDENTIALS = $CredsPath
+  try {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $ExePath unpair 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $ErrorActionPreference = $prev
+  } catch { Write-Host "  unpair failed (continuing)" -ForegroundColor Yellow }
 }
 
 $updateTask = "$ServiceName-update"
@@ -58,7 +75,21 @@ if (-not $KeepFiles -and (Test-Path $InstallDir)) {
   # so default ProgramData inheritance gives us full control.
   try { & takeown.exe /F $InstallDir /R /A /D Y 2>$null | Out-Null } catch { }
   try { & icacls.exe $InstallDir /reset /T /C 2>$null | Out-Null } catch { }
-  Remove-Item -Path $InstallDir -Recurse -Force
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+  $ErrorActionPreference = $prev
+
+  # Fallback: PowerShell's Remove-Item sometimes still chokes on stubborn
+  # ACLs that cmd's rd handles fine. Use it as a last resort.
+  if (Test-Path $InstallDir) {
+    & cmd.exe /c "rd /S /Q `"$InstallDir`"" 2>$null
+  }
+
+  if (Test-Path $InstallDir) {
+    Fail "could not remove $InstallDir — try manually: takeown /F $InstallDir /R /A /D Y; icacls $InstallDir /reset /T /C; rmdir /S /Q $InstallDir"
+  }
 }
 
 Done "uninstall complete"
