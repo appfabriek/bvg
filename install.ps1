@@ -10,7 +10,7 @@
     $env:BVG_JOIN_TOKEN   = "jt_..."
     $env:BVG_BVGEERT_HOST = "https://staging.rozendom.nl"
     $env:BVG_TRANSPORT    = "mijn-verbinding"   # optional
-    iwr https://raw.githubusercontent.com/appfabriek/bvg/main/install.ps1 -UseBasicParsing | iex
+    iwr https://github.com/appfabriek/bvg/releases/latest/download/install.ps1 -UseBasicParsing | iex
 
   The script self-elevates via UAC, downloads the latest
   bvg-windows-x64.zip release asset, redeems the join-token (HTTPS
@@ -28,15 +28,89 @@
 param(
   [string]$Repo        = "appfabriek/bvg",
   [string]$ServiceName = "bvg",
-  [string]$InstallDir  = (Join-Path $env:ProgramData "bvg")
+  [string]$InstallDir  = (Join-Path $env:ProgramData "bvg"),
+  [string]$InstallUrl
 )
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor 0x3000
 
+if (-not $InstallUrl) {
+  $InstallUrl = "https://github.com/$Repo/releases/latest/download/install.ps1"
+}
+
 function Say($msg)  { Write-Host $msg -ForegroundColor Cyan }
 function Done($msg) { Write-Host $msg -ForegroundColor Green }
 function Fail($msg) { Write-Host $msg -ForegroundColor Red; exit 1 }
+
+function Assert-BvgExeSignature {
+  param([string]$Path, [bool]$Required)
+
+  # Private Trust chained naar een GEDEELDE Microsoft-root. Een geldige keten
+  # bewijst dus alleen "ondertekend door een Azure Private-Trust-klant". Pin
+  # daarom op de signer-CN zodat alleen ONZE binary wordt geaccepteerd.
+  $expectedCN = "bvgeert.nl"
+
+  $signature = Get-AuthenticodeSignature -FilePath $Path
+  if ($signature.Status -eq "Valid") {
+    $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { "" }
+    if ($subject -notmatch "CN=$([regex]::Escape($expectedCN))(,|$)") {
+      $msg = "bvg.exe is geldig ondertekend maar door een onverwachte uitgever: '$subject' (verwacht CN=$expectedCN)"
+      if ($Required) { Fail "$msg. Refusing to install." }
+      Say "WARN: $msg"
+      return
+    }
+    Done "bvg.exe Authenticode signature is valid: $subject"
+    return
+  }
+
+  $message = "bvg.exe Authenticode signature is $($signature.Status)"
+  if ($Required) {
+    Fail "$message. Refusing to install a release that requires signed binaries."
+  }
+  Say "WARN: $message - accepting unsigned legacy release"
+}
+
+function Install-CodeSignChain {
+  # Private Trust: de bvg signing-CA-keten zit niet in het Windows root program
+  # EN wordt op restricted/offline machines niet via AIA opgehaald. De binary is
+  # leaf-only getekend (Azure Trusted Signing), dus zonder de intermediates kan
+  # WinVerifyTrust de keten niet bouwen — fataal voor de host die als LocalSystem
+  # draait (geen user-cache, geen netwerk). Daarom levert de release de HELE keten
+  # mee (bvg-codesign-chain.p7b: root + intermediates). Self-signed certs -> de
+  # LocalMachine\Root store, intermediates -> LocalMachine\CA. Idempotent op
+  # thumbprint. Valt terug op de losse root (bvg-codesign-root.cer) voor oude zips.
+  param([string]$Dir)
+
+  $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+  $p7b = Join-Path $Dir "bvg-codesign-chain.p7b"
+  $rootCer = Join-Path $Dir "bvg-codesign-root.cer"
+  try {
+    if (Test-Path $p7b)          { $certs.Import($p7b) }
+    elseif (Test-Path $rootCer)  { $certs.Import($rootCer) }
+    else                         { return }
+  } catch {
+    Say "WARN: kon code-signing keten niet inlezen: $($_.Exception.Message)"
+    return
+  }
+
+  foreach ($cert in $certs) {
+    $storeName = if ($cert.Subject -eq $cert.Issuer) { "Root" } else { "CA" }
+    try {
+      $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+      $store.Open("ReadWrite")
+      if (($store.Certificates.Find("FindByThumbprint", $cert.Thumbprint, $false)).Count -eq 0) {
+        $store.Add($cert)
+        Done "installed code-signing cert in ${storeName}: $($cert.Subject) [$($cert.Thumbprint)]"
+      } else {
+        Say "code-signing cert al aanwezig in ${storeName} [$($cert.Thumbprint)]"
+      }
+      $store.Close()
+    } catch {
+      Say "WARN: kon code-signing cert niet in ${storeName} plaatsen: $($_.Exception.Message)"
+    }
+  }
+}
 
 # --- 1. Self-elevate via UAC ---------------------------------------------
 $IsAdmin = ([Security.Principal.WindowsPrincipal] `
@@ -53,8 +127,9 @@ if (-not $IsAdmin) {
     if ($v) { "`$env:$_ = '$($v -replace ""'"", ""''"")';" }
   }
 
+  $safeInstallUrl = $InstallUrl -replace "'", "''"
   $scriptText = ($envFwd -join " ") + " " + `
-    "iwr https://raw.githubusercontent.com/$Repo/main/install.ps1 -UseBasicParsing | iex"
+    "iwr '$safeInstallUrl' -UseBasicParsing | iex"
   $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
   $pwsh = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { "pwsh.exe" } else { "powershell.exe" }
   Start-Process -FilePath $pwsh `
@@ -113,28 +188,68 @@ if (-not $BvgeertHost -and -not $AzureHub) {
 # --- 3. Download release asset -------------------------------------------
 $null = New-Item -ItemType Directory -Force -Path $InstallDir
 $ZipUrl  = "https://github.com/$Repo/releases/latest/download/bvg-windows-x64.zip"
+$ShaUrl  = "https://github.com/$Repo/releases/latest/download/bvg-windows-x64.zip.sha256"
 $ZipPath = Join-Path $env:TEMP "bvg-windows-x64.zip"
+$ShaPath = Join-Path $env:TEMP "bvg-windows-x64.zip.sha256"
 $ExePath = Join-Path $InstallDir "bvg.exe"
 
 Say "downloading $ZipUrl..."
 try {
   Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -UseBasicParsing
+  Invoke-WebRequest -Uri $ShaUrl -OutFile $ShaPath -UseBasicParsing
 } catch {
   Fail "download failed: $($_.Exception.Message)"
 }
 
-# Stop the service if it already runs so we can overwrite the exe.
+$expectedHash = ((Get-Content -Path $ShaPath -Raw) -split '\s+')[0].ToLower()
+$localHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
+if (-not $expectedHash -or $localHash -ne $expectedHash) {
+  Fail "sha256 mismatch for bvg-windows-x64.zip (downloaded=$localHash expected=$expectedHash)"
+}
+Remove-Item $ShaPath -Force -ErrorAction SilentlyContinue
+
+# Stop EN kill een eventueel draaiende host voordat we uitpakken. De host kan
+# na een eerdere mislukte start "blijven draaien" en bvg.exe + de geladen
+# bvg.Client.dll vergrendelen; dan pakt Expand-Archive maar half uit (versions\
+# leeg, geen state) en faalt de install stil. Stop-Service alleen is niet genoeg
+# (een vastgelopen host reageert niet op de stop), dus killen we het proces hard.
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existing -and $existing.Status -eq "Running") {
   Say "stopping existing service..."
-  Stop-Service -Name $ServiceName -Force
-  Start-Sleep -Seconds 2
+  Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
 }
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -eq "bvg.exe" -or $_.ExecutablePath -eq $ExePath } |
+  ForEach-Object { Say "killing lingering bvg host (PID $($_.ProcessId))..."; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+& taskkill.exe /F /IM bvg.exe /T 2>$null | Out-Null
+Start-Sleep -Seconds 2
 
 Say "extracting to $InstallDir..."
+Remove-Item (Join-Path $InstallDir "signature-required.txt") -Force -ErrorAction SilentlyContinue
 Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
 Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path $ExePath)) { Fail "bvg.exe not found after extract" }
+# Eerst de private signing-root vertrouwen, dan pas de keten valideren -
+# anders geeft Get-AuthenticodeSignature 'UnknownError' op een schone machine.
+Install-CodeSignChain -Dir $InstallDir
+$SignatureRequired = Test-Path (Join-Path $InstallDir "signature-required.txt")
+Assert-BvgExeSignature -Path $ExePath -Required $SignatureRequired
+
+# --- 3b. EXE/DLL-split: verifieer de initiele client-DLL en zet state op ---
+# De zip bevat versions\<v>\bvg.Client.dll. De host laadt die bij start; we
+# verifieren 'm hier (zelfde Valid + CN=bvgeert.nl poort als de exe) en schrijven
+# state\current.json zodat active = last_known_good = deze versie.
+$verRoot = Join-Path $InstallDir "versions"
+$verDir  = Get-ChildItem $verRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+if (-not $verDir) { Fail "versions\ ontbreekt na extract - oude/ongeldige release-zip?" }
+$ClientDll = Join-Path $verDir.FullName "bvg.Client.dll"
+if (-not (Test-Path $ClientDll)) { Fail "bvg.Client.dll niet gevonden in $($verDir.FullName)" }
+Assert-BvgExeSignature -Path $ClientDll -Required $SignatureRequired
+$StateDir = Join-Path $InstallDir "state"
+$null = New-Item -ItemType Directory -Force -Path $StateDir
+@{ active = $verDir.Name; last_known_good = $verDir.Name; fail_counts = @{} } |
+  ConvertTo-Json | Set-Content (Join-Path $StateDir "current.json") -Encoding UTF8
+Done "client $($verDir.Name) geinstalleerd + state geschreven"
 
 # --- 4. One-time pair (redeem join-token) --------------------------------
 $CredentialsPath = Join-Path $InstallDir "credentials.json"
@@ -155,25 +270,11 @@ Say "pairing with bvgeert..."
 # can't reach bvgeert on 443 directly but do allow wss://*.webpubsub.azure.com:443.
 $paired = $false
 
-function Invoke-Bvg {
-  param([string[]]$BvgArgs)
-  # Native commands that write to stderr would otherwise be treated as fatal
-  # PowerShell errors under $ErrorActionPreference = "Stop", killing the
-  # script before we can check $LASTEXITCODE or attempt the azure fallback.
-  $prev = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try {
-    & $ExePath @BvgArgs 2>&1 | ForEach-Object { Write-Host $_ }
-  } finally {
-    $ErrorActionPreference = $prev
-  }
-}
-
 if ($BvgeertHost) {
   Say "  trying direct route via $BvgeertHost..."
   $directArgs = @("join", "--host", $BvgeertHost, "--token", $JoinToken)
   if ($Transport) { $directArgs += @("--transport", $Transport) }
-  Invoke-Bvg $directArgs
+  & $ExePath @directArgs
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via direct route"
@@ -188,7 +289,7 @@ if (-not $paired -and $AzureHub) {
   if (-not $Transport) { Fail "BVG_TRANSPORT is required for azure route" }
   Say "  trying azure route via $AzureHub..."
   $azureArgs = @("join", "--hub", $AzureHub, "--transport", $Transport, "--token", $JoinToken)
-  Invoke-Bvg $azureArgs
+  & $ExePath @azureArgs
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via azure route"
@@ -231,12 +332,22 @@ New-ItemProperty -Path $envKey -Name Environment -PropertyType MultiString -Valu
 
 Say "starting service..."
 & sc.exe start $ServiceName | Out-Null
-Start-Sleep -Seconds 3
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+# Geef de host tijd om de DLL te verifieren, laden en verbinden (tot ~20s).
+$svc = $null
+for ($i = 0; $i -lt 10; $i++) {
+  Start-Sleep -Seconds 2
+  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -eq "Running") { break }
+}
 if ($svc -and $svc.Status -eq "Running") {
   Done "service '$ServiceName' is running"
 } else {
-  Fail "service did not reach Running state - check $InstallDir\logs\"
+  # Toon de reden meteen in deze console i.p.v. een vage 'check logs'.
+  Say "service bereikte 'Running' niet (status: $($svc.Status)). Laatste loglijnen:"
+  $log = Get-ChildItem (Join-Path $InstallDir "logs\bvg-*.log") -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime | Select-Object -Last 1
+  if ($log) { Get-Content $log.FullName -Tail 15 | ForEach-Object { Say "  $_" } }
+  Fail "service did not reach Running state - zie bovenstaande log en $InstallDir\logs\"
 }
 
 # --- 6. Schedule daily self-update ---------------------------------------

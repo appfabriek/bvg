@@ -2,11 +2,11 @@
 # bvg installer for macOS and Linux.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/appfabriek/bvg/main/install.sh | bash
+#   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/install.sh | bash
 #
 # One-shot install + pair (recommended — the bvgeert admin UI generates
 # this line for you):
-#   curl -fsSL https://raw.githubusercontent.com/appfabriek/bvg/main/install.sh \
+#   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/install.sh \
 #     | BVG_JOIN_TOKEN=jt_xxx BVG_BVGEERT_HOST=bvgeert.example bash
 #
 # Env vars (auto-pair triggers when JOIN_TOKEN + a route are both present):
@@ -33,6 +33,36 @@ done_() { printf "\033[32m%s\033[0m\n" "$1"; }
 
 require_curl() { command -v curl >/dev/null 2>&1 || { err "curl not found"; exit 1; }; }
 require_curl
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    err "no sha256sum or shasum found - cannot verify downloads"
+    exit 1
+  fi
+}
+
+verify_sha256() {
+  local file="$1"
+  local sha_url="$2"
+  local expected actual
+
+  expected="$(curl -fsSL --max-time 30 "$sha_url" | awk '{print tolower($1)}')"
+  if [ -z "$expected" ]; then
+    err "empty checksum from $sha_url"
+    exit 1
+  fi
+
+  actual="$(sha256_file "$file")"
+  if [ "$actual" != "$expected" ]; then
+    err "sha256 mismatch for $(basename "$file")"
+    err "downloaded=$actual expected=$expected"
+    exit 1
+  fi
+}
 
 # --- Pre-flight checks ---------------------------------------------------
 # Disk space (need ~250MB for Node bundle + Node-runtime download fallback)
@@ -78,21 +108,31 @@ else
   NODE_DIR="$LIB_DIR/node-v${NODE_VERSION}"
   if [ ! -x "$NODE_DIR/bin/node" ]; then
     say "downloading Node.js ${NODE_VERSION} for $OS-$ARCH..."
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}.tar.xz" \
-      | tar -xJ -C "$LIB_DIR"
+    NODE_ARCHIVE="$LIB_DIR/${NODE_TARBALL}.tar.xz"
+    NODE_SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"
+    curl -fsSL -o "$NODE_ARCHIVE" "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}.tar.xz"
+    NODE_EXPECTED_HASH="$(curl -fsSL "$NODE_SHASUMS_URL" | awk -v file="${NODE_TARBALL}.tar.xz" '$2 == file {print tolower($1)}')"
+    NODE_ACTUAL_HASH="$(sha256_file "$NODE_ARCHIVE")"
+    if [ -z "$NODE_EXPECTED_HASH" ] || [ "$NODE_ACTUAL_HASH" != "$NODE_EXPECTED_HASH" ]; then
+      err "sha256 mismatch for ${NODE_TARBALL}.tar.xz"
+      err "downloaded=$NODE_ACTUAL_HASH expected=$NODE_EXPECTED_HASH"
+      exit 1
+    fi
+    tar -xJ -C "$LIB_DIR" -f "$NODE_ARCHIVE"
+    rm -f "$NODE_ARCHIVE"
     mv "$LIB_DIR/${NODE_TARBALL}" "$NODE_DIR"
   fi
   NODE_BIN="$NODE_DIR/bin/node"
 fi
 
-# Download the bundled CLI from the latest release (fallback to main HEAD).
+# Download the bundled CLI from the latest release and require checksum match.
 say "downloading bvg bundle..."
 BUNDLE_URL="https://github.com/${REPO}/releases/latest/download/bvg.js"
-HTTP_CODE=$(curl -fsSL -o "$LIB_DIR/bvg.js" -w "%{http_code}" "$BUNDLE_URL" 2>/dev/null || echo "404")
-if [ "$HTTP_CODE" = "404" ] || [ ! -s "$LIB_DIR/bvg.js" ]; then
-  say "no release found, trying main branch..."
-  curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/dist/bvg.js" -o "$LIB_DIR/bvg.js"
-fi
+BUNDLE_SHA_URL="https://github.com/${REPO}/releases/latest/download/bvg.js.sha256"
+BUNDLE_TMP="$(mktemp -t bvg.XXXXXXXX.js)"
+curl -fsSL -o "$BUNDLE_TMP" "$BUNDLE_URL"
+verify_sha256 "$BUNDLE_TMP" "$BUNDLE_SHA_URL"
+mv "$BUNDLE_TMP" "$LIB_DIR/bvg.js"
 
 # Wrapper script.
 cat >"$BIN_DIR/bvg" <<EOF
@@ -106,15 +146,13 @@ done_ "bvg installed to $BIN_DIR/bvg"
 # --- Self-update bookkeeping --------------------------------------------
 # Pull the updater script + a version.txt sibling for later semver-compare.
 UPDATER_URL="https://github.com/${REPO}/releases/latest/download/bvg-update.sh"
+UPDATER_SHA_URL="https://github.com/${REPO}/releases/latest/download/bvg-update.sh.sha256"
 VERSION_URL="https://github.com/${REPO}/releases/latest/download/version.txt"
-if curl -fsSL -o "$LIB_DIR/bvg-update.sh" --max-time 30 "$UPDATER_URL" 2>/dev/null; then
-  chmod +x "$LIB_DIR/bvg-update.sh"
-else
-  # Fallback for releases that don't ship the updater asset yet.
-  curl -fsSL -o "$LIB_DIR/bvg-update.sh" --max-time 30 \
-    "https://raw.githubusercontent.com/${REPO}/main/scripts/bvg-update.sh" 2>/dev/null || true
-  [ -f "$LIB_DIR/bvg-update.sh" ] && chmod +x "$LIB_DIR/bvg-update.sh"
-fi
+UPDATER_TMP="$(mktemp -t bvg-update.XXXXXXXX.sh)"
+curl -fsSL -o "$UPDATER_TMP" --max-time 30 "$UPDATER_URL"
+verify_sha256 "$UPDATER_TMP" "$UPDATER_SHA_URL"
+mv "$UPDATER_TMP" "$LIB_DIR/bvg-update.sh"
+chmod +x "$LIB_DIR/bvg-update.sh"
 curl -fsSL -o "$LIB_DIR/version.txt" --max-time 30 "$VERSION_URL" 2>/dev/null || \
   printf '0.0.0' > "$LIB_DIR/version.txt"
 
