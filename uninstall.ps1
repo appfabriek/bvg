@@ -19,6 +19,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Native-command stderr (sc.exe, taskkill) mag uninstall niet aborten onder
+# PS 7.3+ ($PSNativeCommandUseErrorActionPreference). No-op in 5.1.
+$PSNativeCommandUseErrorActionPreference = $false
 
 function Say($msg)  { Write-Host $msg -ForegroundColor Cyan }
 function Done($msg) { Write-Host $msg -ForegroundColor Green }

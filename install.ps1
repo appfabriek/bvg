@@ -33,6 +33,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Native commands (bvg.exe join, taskkill, sc.exe) schrijven soms naar stderr
+# zonder dat het een fout is (bv. "falling back to azure..."). In PS 7.3+ maakt
+# $PSNativeCommandUseErrorActionPreference dat onder Stop tot een terminating
+# error -> de install zou stoppen vóór de exit-code-check. Uitzetten; we checken
+# overal expliciet $LASTEXITCODE. (Bestaat niet in 5.1; setten is daar no-op.)
+$PSNativeCommandUseErrorActionPreference = $false
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor 0x3000
 
 if (-not $InstallUrl) {
@@ -277,7 +283,9 @@ if ($BvgeertHost) {
   Say "  trying direct route via $BvgeertHost..."
   $directArgs = @("join", "--host", $BvgeertHost, "--token", $JoinToken)
   if ($Transport) { $directArgs += @("--transport", $Transport) }
-  & $ExePath @directArgs
+  # 2>&1 zodat bvg.exe's stderr-meldingen (bv. azure-fallback) geen terminating
+  # NativeCommandError worden; exit-code blijft leidend.
+  & $ExePath @directArgs 2>&1 | ForEach-Object { Write-Host ([string]$_) }
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via direct route"
@@ -292,7 +300,7 @@ if (-not $paired -and $AzureHub) {
   if (-not $Transport) { Fail "BVG_TRANSPORT is required for azure route" }
   Say "  trying azure route via $AzureHub..."
   $azureArgs = @("join", "--hub", $AzureHub, "--transport", $Transport, "--token", $JoinToken)
-  & $ExePath @azureArgs
+  & $ExePath @azureArgs 2>&1 | ForEach-Object { Write-Host ([string]$_) }
   if ($LASTEXITCODE -eq 0) {
     $paired = $true
     Done "  paired via azure route"
