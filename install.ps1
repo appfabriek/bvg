@@ -221,7 +221,10 @@ if ($existing -and $existing.Status -eq "Running") {
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
   Where-Object { $_.Name -eq "bvg.exe" -or $_.ExecutablePath -eq $ExePath } |
   ForEach-Object { Say "killing lingering bvg host (PID $($_.ProcessId))..."; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-& taskkill.exe /F /IM bvg.exe /T 2>$null | Out-Null
+# Vangnet (kill ook child-processen). Volledig binnen cmd zodat taskkill's
+# "not found"-stderr op een schone machine GEEN terminating NativeCommandError
+# wordt onder $ErrorActionPreference='Stop'.
+cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1"
 Start-Sleep -Seconds 2
 
 Say "extracting to $InstallDir..."
