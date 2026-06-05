@@ -50,7 +50,7 @@ if ($svc) {
 # DLL-fout "blijven draaien" en bvg.exe + credentials.json vergrendelen; dan
 # faalt Remove-Item hieronder met "in use" (los van de ACL-reset). Volledig
 # binnen cmd zodat taskkill's "not found"-stderr geen terminating error wordt.
-cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1"
+cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1 & exit 0"
 Start-Sleep -Seconds 2
 
 $updateTask = "$ServiceName-update"

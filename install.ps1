@@ -230,7 +230,7 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 # Vangnet (kill ook child-processen). Volledig binnen cmd zodat taskkill's
 # "not found"-stderr op een schone machine GEEN terminating NativeCommandError
 # wordt onder $ErrorActionPreference='Stop'.
-cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1"
+cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1 & exit 0"
 Start-Sleep -Seconds 2
 
 Say "extracting to $InstallDir..."
@@ -283,16 +283,19 @@ if ($BvgeertHost) {
   Say "  trying direct route via $BvgeertHost..."
   $directArgs = @("join", "--host", $BvgeertHost, "--token", $JoinToken)
   if ($Transport) { $directArgs += @("--transport", $Transport) }
-  # 2>&1 zodat bvg.exe's stderr-meldingen (bv. azure-fallback) geen terminating
-  # NativeCommandError worden; exit-code blijft leidend.
-  & $ExePath @directArgs 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-  if ($LASTEXITCODE -eq 0) {
+  # bvg.exe via Start-Process: een non-zero exit (directe route faalt vaak en
+  # valt terug op azure) of stderr mag NOOIT een terminating error worden.
+  # Onder $ErrorActionPreference='Stop' doet `& bvg.exe` dat wel zodra
+  # $PSNativeCommandUseErrorActionPreference $true is (default in sommige PS7;
+  # via iex niet betrouwbaar uit te zetten). Start-Process omzeilt dat volledig.
+  $ec = (Start-Process -FilePath $ExePath -ArgumentList $directArgs -Wait -NoNewWindow -PassThru).ExitCode
+  if ($ec -eq 0) {
     $paired = $true
     Done "  paired via direct route"
   } elseif ($AzureHub) {
-    Say "  direct route failed (exit $LASTEXITCODE) - falling back to azure route"
+    Say "  direct route failed (exit $ec) - falling back to azure route"
   } else {
-    Fail "direct route failed (exit $LASTEXITCODE) and no BVG_AZURE_HUB to fall back on"
+    Fail "direct route failed (exit $ec) and no BVG_AZURE_HUB to fall back on"
   }
 }
 
@@ -300,12 +303,12 @@ if (-not $paired -and $AzureHub) {
   if (-not $Transport) { Fail "BVG_TRANSPORT is required for azure route" }
   Say "  trying azure route via $AzureHub..."
   $azureArgs = @("join", "--hub", $AzureHub, "--transport", $Transport, "--token", $JoinToken)
-  & $ExePath @azureArgs 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-  if ($LASTEXITCODE -eq 0) {
+  $ec = (Start-Process -FilePath $ExePath -ArgumentList $azureArgs -Wait -NoNewWindow -PassThru).ExitCode
+  if ($ec -eq 0) {
     $paired = $true
     Done "  paired via azure route"
   } else {
-    Fail "azure route failed (exit $LASTEXITCODE)"
+    Fail "azure route failed (exit $ec)"
   }
 }
 
