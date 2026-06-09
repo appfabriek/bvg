@@ -53,7 +53,7 @@ $CertStoreLocation = if ($Portable) { "CurrentUser" } else { "LocalMachine" }
 # Native commands (bvg.exe join, taskkill, sc.exe) schrijven soms naar stderr
 # zonder dat het een fout is (bv. "falling back to azure..."). In PS 7.3+ maakt
 # $PSNativeCommandUseErrorActionPreference dat onder Stop tot een terminating
-# error -> de install zou stoppen vóór de exit-code-check. Uitzetten; we checken
+# error -> de install zou stoppen voor de exit-code-check. Uitzetten; we checken
 # overal expliciet $LASTEXITCODE. (Bestaat niet in 5.1; setten is daar no-op.)
 $PSNativeCommandUseErrorActionPreference = $false
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor 0x3000
@@ -98,7 +98,7 @@ function Install-CodeSignChain {
   # Private Trust: de bvg signing-CA-keten zit niet in het Windows root program
   # EN wordt op restricted/offline machines niet via AIA opgehaald. De binary is
   # leaf-only getekend (Azure Trusted Signing), dus zonder de intermediates kan
-  # WinVerifyTrust de keten niet bouwen — fataal voor de host die als LocalSystem
+  # WinVerifyTrust de keten niet bouwen - fataal voor de host die als LocalSystem
   # draait (geen user-cache, geen netwerk). Daarom levert de release de HELE keten
   # mee (bvg-codesign-chain.p7b: root + intermediates). Self-signed certs -> de
   # LocalMachine\Root store, intermediates -> LocalMachine\CA. Idempotent op
@@ -172,9 +172,9 @@ if ($WinVer.Major -lt 10) {
   Fail "Windows 10 or newer is required (detected: $($WinVer.ToString()))"
 }
 
-# Disk space — 200 MB needed (77MB exe + 77MB rollback + headroom).
+# Disk space - 200 MB needed (77MB exe + 77MB rollback + headroom).
 # Get-Item zonder -LiteralPath/-Force faalt op Win11 26200 voor
-# C:\ProgramData ("Could not find item") — directory-junction quirk.
+# C:\ProgramData ("Could not find item") - directory-junction quirk.
 # DriveInfo omzeilt het pad-provider-gedoe helemaal.
 $drive = [System.IO.DriveInfo]::new((Split-Path $env:ProgramData -Qualifier))
 if ($drive.AvailableFreeSpace -lt 200MB) {
@@ -205,11 +205,11 @@ $AzureHub    = $env:BVG_AZURE_HUB
 $Domain      = $env:BVG_DOMAIN
 
 # Token is OPTIONEEL (#369, verfijnd #371): zonder token doen we een anonieme
-# install — binary + install.env, GEEN pair. We slaan de service NIET meer over
+# install - binary + install.env, GEEN pair. We slaan de service NIET meer over
 # (was Spec 1): de service-install draait nu ook in het token-loze pad, zodat de
 # host als pre-enroll daemon start en de DLL anoniem vers houdt via het
 # PublicUpdateChannel (Spec 2). De gebruiker enrollt later met
-# `bvg.exe enroll --token <jt>` → bij de volgende start draait hij de normale,
+# `bvg.exe enroll --token <jt>` -> bij de volgende start draait hij de normale,
 # geauthenticeerde modus. Met token blijft alles ongewijzigd. `-Portable` blijft
 # service-loos (start zelf `bvg.exe daemon`).
 $Anonymous = (-not $JoinToken)
@@ -256,7 +256,7 @@ if (-not $Portable -and $existing -and $existing.Status -eq "Running") {
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
   Where-Object { $_.ExecutablePath -eq $ExePath -or (-not $Portable -and $_.Name -eq "bvg.exe") } |
   ForEach-Object { Say "killing lingering bvg host (PID $($_.ProcessId))..."; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-# Vangnet (kill ook child-processen) — image-wide, dus ALLEEN niet-portable.
+# Vangnet (kill ook child-processen) - image-wide, dus ALLEEN niet-portable.
 # Volledig binnen cmd zodat taskkill's "not found"-stderr op een schone machine
 # GEEN terminating NativeCommandError wordt onder $ErrorActionPreference='Stop'.
 if (-not $Portable) {
@@ -305,12 +305,12 @@ Done "host/route bewaard in $InstallEnvPath"
 
 # --- Anonieme install (geen token): GEEN pair, maar WEL de service ----------
 # Spec 2 (#371): de token-loze install registreert + start de service alsnog,
-# zodat de host als pre-enroll daemon draait (detecteert "niet geënrolld" →
-# anoniem PublicUpdateChannel → DLL vers houden). De pairing-stap (sectie 4)
+# zodat de host als pre-enroll daemon draait (detecteert "niet geenrolld" ->
+# anoniem PublicUpdateChannel -> DLL vers houden). De pairing-stap (sectie 4)
 # wordt overgeslagen; al het overige (service-registratie, self-update-task)
 # loopt identiek aan de getokende install. `-Portable` blijft service-loos.
 if ($Anonymous) {
-  Done "geen token → anonieme install; host start als pre-enroll daemon (DLL vers via PublicUpdateChannel)"
+  Done "geen token -> anonieme install; host start als pre-enroll daemon (DLL vers via PublicUpdateChannel)"
   Write-Host "enroll later met: & '$ExePath' enroll --token <jt_...>   (host/route uit install.env)"
 }
 
@@ -325,8 +325,8 @@ if (-not $Anonymous) {
 
 # Een vorige install zet credentials.json read-only voor Administrators
 # (alleen SYSTEM krijgt Full). Bij re-install kan `bvg join` 'em
-# dan niet overschrijven → 'Access to the path … is denied'. Admins
-# mogen via directory-ACL wel verwijderen — los de stale file dus eerst op.
+# dan niet overschrijven -> 'Access to the path ... is denied'. Admins
+# mogen via directory-ACL wel verwijderen - los de stale file dus eerst op.
 if (Test-Path -LiteralPath $CredentialsPath) {
   Remove-Item -LiteralPath $CredentialsPath -Force -ErrorAction SilentlyContinue
 }
@@ -334,7 +334,7 @@ if (Test-Path -LiteralPath $CredentialsPath) {
 Say "pairing with bvgeert..."
 
 # Try direct route first if BVG_BVGEERT_HOST is set. If direct fails AND BVG_AZURE_HUB
-# is also set, fall back to the azure route — this covers restricted networks that
+# is also set, fall back to the azure route - this covers restricted networks that
 # can't reach bvgeert on 443 directly but do allow wss://*.webpubsub.azure.com:443.
 $paired = $false
 
@@ -375,7 +375,7 @@ if (-not $paired) { Fail "pairing failed - no route succeeded" }
 
 # Defensive lock-down: bvg.exe already restricts the ACL on save, but
 # enforce the spec ("SYSTEM + Administrators read only") explicitly here too.
-# Portable (user-level) slaat dit over: de creds zijn dan user-privé in
+# Portable (user-level) slaat dit over: de creds zijn dan user-prive in
 # %LocalAppData% en een SYSTEM/Administrators-only ACL zou de gebruiker zelf
 # buitensluiten.
 if (-not $Portable -and (Test-Path $CredentialsPath)) {
@@ -465,7 +465,7 @@ if (Test-Path $UpdaterScript) {
 
 # Persist version stamp so the updater knows what's installed.
 if (Test-Path (Join-Path $InstallDir "version.txt")) {
-  # Already in the zip — keep what the release stamped.
+  # Already in the zip - keep what the release stamped.
 } else {
   # Fallback: ask the exe.
   try { (& $ExePath --version).Trim() | Set-Content -Path (Join-Path $InstallDir "version.txt") -NoNewline -Encoding ASCII } catch { }
@@ -476,7 +476,7 @@ Write-Host ""
 Write-Host "logs:         $InstallDir\logs\bvg-*.log"
 Write-Host "credentials:  $CredentialsPath"
 if ($Anonymous) {
-  Write-Host "mode:         pre-enroll (niet geënrolld) — DLL vers via PublicUpdateChannel"
+  Write-Host "mode:         pre-enroll (niet geenrolld) - DLL vers via PublicUpdateChannel"
   Write-Host "enroll:       & '$ExePath' enroll --token <jt_...>   (host/route uit install.env)"
 }
 if ($Portable) {

@@ -61,7 +61,7 @@ if ($existingTask) {
 }
 
 # Verwijder de Private Trust signing-keten die install.ps1 in de machine-stores
-# zette (root in Root, intermediates in CA). Lees 'm uit InstallDir vóór we de
+# zette (root in Root, intermediates in CA). Lees 'm uit InstallDir vEEr we de
 # bestanden weggooien. No-op bij Public Trust of legacy installs.
 $chainCerts = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
 $p7b = Join-Path $InstallDir "bvg-codesign-chain.p7b"
@@ -88,7 +88,7 @@ foreach ($cert in $chainCerts) {
 if (-not $KeepFiles -and (Test-Path $InstallDir)) {
   Say "removing $InstallDir..."
   # credentials.json staat op een strakke ACL (alleen SYSTEM:Full, Administrators:Read,
-  # zonder inheritance) — daardoor faalt Remove-Item met "Access denied". Neem eerst
+  # zonder inheritance) - daardoor faalt Remove-Item met "Access denied". Neem eerst
   # ownership van de tree en reset de ACL's zodat alles verwijderbaar is.
   try {
     & takeown.exe /F $InstallDir /R /A /D Y *> $null
