@@ -1,8 +1,13 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  bvg installer for Windows. Installs as a Windows service running
+  bvg installer for Windows. Default: installs as a Windows service running
   under Local System, starts automatically at boot, restarts on crash.
+
+  Optioneel `-Portable` (of `$env:BVG_PORTABLE=1`): service-loze, user-level
+  install in %LocalAppData%\bvg, code-sign-keten in de CurrentUser-stores,
+  geen Windows-service, geen scheduled task, geen admin/UAC. Starten doe je
+  zelf met `bvg.exe daemon` (BVG_INSTALL_DIR wijst de host naar de install-dir).
 
 .DESCRIPTION
   One-liner install:
@@ -29,10 +34,22 @@ param(
   [string]$Repo        = "appfabriek/bvg",
   [string]$ServiceName = "bvg",
   [string]$InstallDir  = (Join-Path $env:ProgramData "bvg"),
-  [string]$InstallUrl
+  [string]$InstallUrl,
+  # Service-loze, user-level install: geen Windows-service, geen scheduled task,
+  # geen admin/UAC. Installeert naar %LocalAppData%\bvg en zet de code-sign-keten
+  # in de CurrentUser-stores. Starten doe je zelf met `bvg.exe daemon`.
+  [switch]$Portable
 )
 
 $ErrorActionPreference = "Stop"
+
+# Portable kan ook via env (zodat de iwr|iex-oneliner werkt: $env:BVG_PORTABLE=1).
+if ($env:BVG_PORTABLE -eq "1" -or $env:BVG_PORTABLE -eq "true") { $Portable = $true }
+if ($Portable -and -not $PSBoundParameters.ContainsKey('InstallDir')) {
+  $InstallDir = Join-Path $env:LOCALAPPDATA "bvg"
+}
+# Code-sign-keten: machine-stores vereisen admin; user-level gaat naar CurrentUser.
+$CertStoreLocation = if ($Portable) { "CurrentUser" } else { "LocalMachine" }
 # Native commands (bvg.exe join, taskkill, sc.exe) schrijven soms naar stderr
 # zonder dat het een fout is (bv. "falling back to azure..."). In PS 7.3+ maakt
 # $PSNativeCommandUseErrorActionPreference dat onder Stop tot een terminating
@@ -86,7 +103,7 @@ function Install-CodeSignChain {
   # mee (bvg-codesign-chain.p7b: root + intermediates). Self-signed certs -> de
   # LocalMachine\Root store, intermediates -> LocalMachine\CA. Idempotent op
   # thumbprint. Valt terug op de losse root (bvg-codesign-root.cer) voor oude zips.
-  param([string]$Dir)
+  param([string]$Dir, [string]$StoreLocation = "LocalMachine")
 
   $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
   $p7b = Join-Path $Dir "bvg-codesign-chain.p7b"
@@ -103,7 +120,7 @@ function Install-CodeSignChain {
   foreach ($cert in $certs) {
     $storeName = if ($cert.Subject -eq $cert.Issuer) { "Root" } else { "CA" }
     try {
-      $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+      $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, $StoreLocation)
       $store.Open("ReadWrite")
       if (($store.Certificates.Find("FindByThumbprint", $cert.Thumbprint, $false)).Count -eq 0) {
         $store.Add($cert)
@@ -123,7 +140,9 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] `
   [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
-if (-not $IsAdmin) {
+if ($Portable) {
+  Say "portable (service-loze, user-level) install in $InstallDir - geen admin/UAC nodig"
+} elseif (-not $IsAdmin) {
   Say "elevation required - relaunching with UAC prompt..."
   # Forward the env-vars the elevated session needs.
   $envFwd = @(
@@ -220,17 +239,22 @@ Remove-Item $ShaPath -Force -ErrorAction SilentlyContinue
 # leeg, geen state) en faalt de install stil. Stop-Service alleen is niet genoeg
 # (een vastgelopen host reageert niet op de stop), dus killen we het proces hard.
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existing -and $existing.Status -eq "Running") {
+# Portable raakt de bestaande Windows-service NOOIT aan (andere install-dir;
+# de service lockt de portable-dir niet). We killen alleen een eventueel eerder
+# portable-proces uit DEZE $ExePath.
+if (-not $Portable -and $existing -and $existing.Status -eq "Running") {
   Say "stopping existing service..."
   Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
 }
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-  Where-Object { $_.Name -eq "bvg.exe" -or $_.ExecutablePath -eq $ExePath } |
+  Where-Object { $_.ExecutablePath -eq $ExePath -or (-not $Portable -and $_.Name -eq "bvg.exe") } |
   ForEach-Object { Say "killing lingering bvg host (PID $($_.ProcessId))..."; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-# Vangnet (kill ook child-processen). Volledig binnen cmd zodat taskkill's
-# "not found"-stderr op een schone machine GEEN terminating NativeCommandError
-# wordt onder $ErrorActionPreference='Stop'.
-cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1 & exit 0"
+# Vangnet (kill ook child-processen) — image-wide, dus ALLEEN niet-portable.
+# Volledig binnen cmd zodat taskkill's "not found"-stderr op een schone machine
+# GEEN terminating NativeCommandError wordt onder $ErrorActionPreference='Stop'.
+if (-not $Portable) {
+  cmd.exe /c "taskkill /F /IM bvg.exe /T >nul 2>&1 & exit 0"
+}
 Start-Sleep -Seconds 2
 
 Say "extracting to $InstallDir..."
@@ -240,7 +264,7 @@ Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path $ExePath)) { Fail "bvg.exe not found after extract" }
 # Eerst de private signing-root vertrouwen, dan pas de keten valideren -
 # anders geeft Get-AuthenticodeSignature 'UnknownError' op een schone machine.
-Install-CodeSignChain -Dir $InstallDir
+Install-CodeSignChain -Dir $InstallDir -StoreLocation $CertStoreLocation
 $SignatureRequired = Test-Path (Join-Path $InstallDir "signature-required.txt")
 Assert-BvgExeSignature -Path $ExePath -Required $SignatureRequired
 
@@ -263,6 +287,9 @@ Done "client $($verDir.Name) geinstalleerd + state geschreven"
 # --- 4. One-time pair (redeem join-token) --------------------------------
 $CredentialsPath = Join-Path $InstallDir "credentials.json"
 $env:BVG_CREDENTIALS = $CredentialsPath
+# Portable: de host leest BVG_INSTALL_DIR voor versions\/state\; zet 'm nu in de
+# sessie (zodat een in-install host-aanroep klopt) en straks persistent via setx.
+if ($Portable) { $env:BVG_INSTALL_DIR = $InstallDir }
 
 # Een vorige install zet credentials.json read-only voor Administrators
 # (alleen SYSTEM krijgt Full). Bij re-install kan `bvg join` 'em
@@ -316,13 +343,18 @@ if (-not $paired) { Fail "pairing failed - no route succeeded" }
 
 # Defensive lock-down: bvg.exe already restricts the ACL on save, but
 # enforce the spec ("SYSTEM + Administrators read only") explicitly here too.
-if (Test-Path $CredentialsPath) {
+# Portable (user-level) slaat dit over: de creds zijn dan user-privé in
+# %LocalAppData% en een SYSTEM/Administrators-only ACL zou de gebruiker zelf
+# buitensluiten.
+if (-not $Portable -and (Test-Path $CredentialsPath)) {
   & icacls.exe $CredentialsPath /inheritance:r `
     /grant:r "SYSTEM:(F)" `
     /grant:r "Administrators:(R)" | Out-Null
 }
 
-# --- 5. Register Windows service -----------------------------------------
+# --- 5+6. Windows-service + dagelijkse self-update (overgeslagen in portable) ---
+if (-not $Portable) {
+
 if ($existing) {
   Say "removing previous service registration..."
   & sc.exe delete $ServiceName | Out-Null
@@ -386,6 +418,8 @@ if (Test-Path $UpdaterScript) {
   Say "WARN: $UpdaterScript not found - skipping self-update scheduler (older release zip?)"
 }
 
+} # einde niet-portable (service + self-update)
+
 # Persist version stamp so the updater knows what's installed.
 if (Test-Path (Join-Path $InstallDir "version.txt")) {
   # Already in the zip — keep what the release stamped.
@@ -398,9 +432,23 @@ Done "installation complete"
 Write-Host ""
 Write-Host "logs:         $InstallDir\logs\bvg-*.log"
 Write-Host "credentials:  $CredentialsPath"
-Write-Host "service:      sc.exe query $ServiceName"
-Write-Host "update task:  Get-ScheduledTask -TaskName $UpdateTaskName"
-Write-Host "update log:   $InstallDir\logs\updater.log"
-Write-Host "force update: Start-ScheduledTask -TaskName $UpdateTaskName"
-Write-Host "opt-out:      Disable-ScheduledTask -TaskName $UpdateTaskName"
-Write-Host "re-pair:      `$env:BVG_CREDENTIALS = '$CredentialsPath'; & '$ExePath' join --host <host> --token <jt_...>; Restart-Service $ServiceName"
+if ($Portable) {
+  # Persisteer de paden als user-env zodat `bvg.exe daemon` ze in een nieuwe
+  # console vindt. BVG_INSTALL_DIR is vereist (default is %ProgramData%).
+  & setx BVG_INSTALL_DIR "$InstallDir" | Out-Null
+  & setx BVG_CREDENTIALS "$CredentialsPath" | Out-Null
+  Write-Host ""
+  Write-Host "PORTABLE install (geen Windows-service). zelf starten:"
+  Write-Host "  `$env:BVG_INSTALL_DIR = '$InstallDir'"
+  Write-Host "  & '$ExePath' daemon"
+  Write-Host "(BVG_INSTALL_DIR + BVG_CREDENTIALS zijn als user-env gezet voor nieuwe consoles)"
+  Write-Host "re-pair:      & '$ExePath' join --host <host> --token <jt_...>"
+  Write-Host "update:       her-run install.ps1 -Portable (of draai bvg-update.ps1 handmatig)"
+} else {
+  Write-Host "service:      sc.exe query $ServiceName"
+  Write-Host "update task:  Get-ScheduledTask -TaskName $UpdateTaskName"
+  Write-Host "update log:   $InstallDir\logs\updater.log"
+  Write-Host "force update: Start-ScheduledTask -TaskName $UpdateTaskName"
+  Write-Host "opt-out:      Disable-ScheduledTask -TaskName $UpdateTaskName"
+  Write-Host "re-pair:      `$env:BVG_CREDENTIALS = '$CredentialsPath'; & '$ExePath' join --host <host> --token <jt_...>; Restart-Service $ServiceName"
+}
