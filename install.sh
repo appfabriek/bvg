@@ -170,18 +170,23 @@ curl -fsSL -o "$LIB_DIR/version.txt" --max-time 30 "$VERSION_URL" 2>/dev/null ||
 # Decide pairing route from env-vars.
 HAS_TOKEN="${BVG_JOIN_TOKEN:-}"
 PAIRED=0
-if [ -n "$HAS_TOKEN" ]; then
-  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bvg"
-  mkdir -p "$CONFIG_DIR"
-  CONFIG_ENV="$CONFIG_DIR/install.env"
-  {
-    [ -n "${BVG_DOMAIN:-}" ]       && echo "BVG_DOMAIN=$BVG_DOMAIN"
-    [ -n "${BVG_BVGEERT_HOST:-}" ] && echo "BVG_BVGEERT_HOST=$BVG_BVGEERT_HOST"
-    [ -n "${BVG_AZURE_HUB:-}" ]    && echo "BVG_AZURE_HUB=$BVG_AZURE_HUB"
-    [ -n "${BVG_TRANSPORT:-}" ]    && echo "BVG_TRANSPORT=$BVG_TRANSPORT"
-  } > "$CONFIG_ENV"
-  chmod 600 "$CONFIG_ENV"
 
+# Schrijf install.env ALTIJD (ook zonder token) zodat een latere `bvg enroll`
+# de host/route uit dit bestand kan lezen en de gebruiker alleen het token hoeft
+# te geven (#369). install.env staat naast credentials op de XDG-config-locatie.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bvg"
+mkdir -p "$CONFIG_DIR"
+CONFIG_ENV="$CONFIG_DIR/install.env"
+{
+  [ -n "${BVG_DOMAIN:-}" ]       && echo "BVG_DOMAIN=$BVG_DOMAIN"
+  [ -n "${BVG_BVGEERT_HOST:-}" ] && echo "BVG_BVGEERT_HOST=$BVG_BVGEERT_HOST"
+  [ -n "${BVG_AZURE_HUB:-}" ]    && echo "BVG_AZURE_HUB=$BVG_AZURE_HUB"
+  [ -n "${BVG_TRANSPORT:-}" ]    && echo "BVG_TRANSPORT=$BVG_TRANSPORT"
+  true  # zorg dat het blok niet faalt onder set -e als alle vars leeg zijn
+} > "$CONFIG_ENV"
+chmod 600 "$CONFIG_ENV"
+
+if [ -n "$HAS_TOKEN" ]; then
   if [ -n "${BVG_BVGEERT_HOST:-}" ]; then
     say "pairing with bvgeert directly at $BVG_BVGEERT_HOST..."
     "$BIN_DIR/bvg" join --host "$BVG_BVGEERT_HOST" --token "$HAS_TOKEN" \
@@ -321,5 +326,10 @@ case ":$PATH:" in
   *) say "Add $BIN_DIR to your PATH: export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-say "next step: bvg join --host <bvgeert-host> --token <jt_xxx>"
-say "           of (Azure-fallback): bvg join --hub <wss-url> --transport <id> --token <jt_xxx>"
+done_ "geen token → geïnstalleerd (offline, geen service); host/route bewaard in $CONFIG_ENV"
+say "enroll later met: bvg enroll --token <jt_xxx>"
+say "  (host/route komt uit install.env; daarna 'bvg daemon' of her-run install met token voor de service)"
+say ""
+say "alternatief — direct met een token pairen:"
+say "  bvg join --host <bvgeert-host> --token <jt_xxx>"
+say "  of (Azure-fallback): bvg join --hub <wss-url> --transport <id> --token <jt_xxx>"

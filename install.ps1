@@ -202,10 +202,17 @@ $JoinToken   = $env:BVG_JOIN_TOKEN
 $BvgeertHost = $env:BVG_BVGEERT_HOST
 $Transport   = $env:BVG_TRANSPORT
 $AzureHub    = $env:BVG_AZURE_HUB
+$Domain      = $env:BVG_DOMAIN
 
-if (-not $JoinToken) {
-  Fail "BVG_JOIN_TOKEN is required. Get a join-token from the bvgeert admin (Admin > Connections > new client)."
-}
+# Token is OPTIONEEL (#369, verfijnd #371): zonder token doen we een anonieme
+# install — binary + install.env, GEEN pair. We slaan de service NIET meer over
+# (was Spec 1): de service-install draait nu ook in het token-loze pad, zodat de
+# host als pre-enroll daemon start en de DLL anoniem vers houdt via het
+# PublicUpdateChannel (Spec 2). De gebruiker enrollt later met
+# `bvg.exe enroll --token <jt>` → bij de volgende start draait hij de normale,
+# geauthenticeerde modus. Met token blijft alles ongewijzigd. `-Portable` blijft
+# service-loos (start zelf `bvg.exe daemon`).
+$Anonymous = (-not $JoinToken)
 if (-not $BvgeertHost -and -not $AzureHub) {
   Fail "BVG_BVGEERT_HOST is required (direct mode) or BVG_AZURE_HUB (azure mode)."
 }
@@ -284,12 +291,37 @@ $null = New-Item -ItemType Directory -Force -Path $StateDir
   ConvertTo-Json | Set-Content (Join-Path $StateDir "current.json") -Encoding UTF8
 Done "client $($verDir.Name) geinstalleerd + state geschreven"
 
+# --- install.env: bewaar host/route zodat `bvg enroll` ze later kan lezen ----
+# Altijd schrijven (ook bij anonieme install) onder $InstallDir, zodat een latere
+# `bvg.exe enroll --token <jt>` alleen het token nodig heeft (#369).
+$InstallEnvPath = Join-Path $InstallDir "install.env"
+$envLines = @()
+if ($Domain)      { $envLines += "BVG_DOMAIN=$Domain" }
+if ($BvgeertHost) { $envLines += "BVG_BVGEERT_HOST=$BvgeertHost" }
+if ($AzureHub)    { $envLines += "BVG_AZURE_HUB=$AzureHub" }
+if ($Transport)   { $envLines += "BVG_TRANSPORT=$Transport" }
+Set-Content -Path $InstallEnvPath -Value $envLines -Encoding ASCII
+Done "host/route bewaard in $InstallEnvPath"
+
+# --- Anonieme install (geen token): GEEN pair, maar WEL de service ----------
+# Spec 2 (#371): de token-loze install registreert + start de service alsnog,
+# zodat de host als pre-enroll daemon draait (detecteert "niet geënrolld" →
+# anoniem PublicUpdateChannel → DLL vers houden). De pairing-stap (sectie 4)
+# wordt overgeslagen; al het overige (service-registratie, self-update-task)
+# loopt identiek aan de getokende install. `-Portable` blijft service-loos.
+if ($Anonymous) {
+  Done "geen token → anonieme install; host start als pre-enroll daemon (DLL vers via PublicUpdateChannel)"
+  Write-Host "enroll later met: & '$ExePath' enroll --token <jt_...>   (host/route uit install.env)"
+}
+
 # --- 4. One-time pair (redeem join-token) --------------------------------
 $CredentialsPath = Join-Path $InstallDir "credentials.json"
 $env:BVG_CREDENTIALS = $CredentialsPath
 # Portable: de host leest BVG_INSTALL_DIR voor versions\/state\; zet 'm nu in de
 # sessie (zodat een in-install host-aanroep klopt) en straks persistent via setx.
 if ($Portable) { $env:BVG_INSTALL_DIR = $InstallDir }
+
+if (-not $Anonymous) {
 
 # Een vorige install zet credentials.json read-only voor Administrators
 # (alleen SYSTEM krijgt Full). Bij re-install kan `bvg join` 'em
@@ -352,7 +384,11 @@ if (-not $Portable -and (Test-Path $CredentialsPath)) {
     /grant:r "Administrators:(R)" | Out-Null
 }
 
+} # einde getokende pairing (overgeslagen bij anonieme install)
+
 # --- 5+6. Windows-service + dagelijkse self-update (overgeslagen in portable) ---
+# Draait OOK in het anonieme pad (#371): de service start de host als
+# pre-enroll daemon. Alleen -Portable blijft service-loos.
 if (-not $Portable) {
 
 if ($existing) {
@@ -369,11 +405,18 @@ if ($LASTEXITCODE -ne 0) { Fail "sc.exe create failed (exit $LASTEXITCODE)" }
 & sc.exe failure $ServiceName reset= 3600 actions= restart/10000/restart/10000/restart/10000 | Out-Null
 
 # Persist BVG_CREDENTIALS as a per-service env-var so the LocalSystem
-# context reads from %ProgramData% instead of LOCALAPPDATA.
+# context reads from %ProgramData% instead of LOCALAPPDATA. Bij een anonieme
+# install bestaat credentials.json nog niet; het pad wijst alvast naar de
+# plek waar `bvg enroll` 'm straks schrijft. Bij een niet-default install-dir
+# zetten we ook BVG_INSTALL_DIR zodat de host install.env/versions/state vindt
+# (de pre-enroll daemon leest host/route uit install.env).
 $envKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 $existingEnv = @()
 try { $existingEnv = (Get-ItemProperty -Path $envKey -Name Environment -ErrorAction Stop).Environment } catch { }
-$mergedEnv = @($existingEnv | Where-Object { $_ -notlike "BVG_CREDENTIALS=*" }) + "BVG_CREDENTIALS=$CredentialsPath"
+$mergedEnv = @($existingEnv | Where-Object { $_ -notlike "BVG_CREDENTIALS=*" -and $_ -notlike "BVG_INSTALL_DIR=*" }) + "BVG_CREDENTIALS=$CredentialsPath"
+if ($InstallDir -ne (Join-Path $env:ProgramData "bvg")) {
+  $mergedEnv += "BVG_INSTALL_DIR=$InstallDir"
+}
 New-ItemProperty -Path $envKey -Name Environment -PropertyType MultiString -Value $mergedEnv -Force | Out-Null
 
 Say "starting service..."
@@ -432,6 +475,10 @@ Done "installation complete"
 Write-Host ""
 Write-Host "logs:         $InstallDir\logs\bvg-*.log"
 Write-Host "credentials:  $CredentialsPath"
+if ($Anonymous) {
+  Write-Host "mode:         pre-enroll (niet geënrolld) — DLL vers via PublicUpdateChannel"
+  Write-Host "enroll:       & '$ExePath' enroll --token <jt_...>   (host/route uit install.env)"
+}
 if ($Portable) {
   # Persisteer de paden als user-env zodat `bvg.exe daemon` ze in een nieuwe
   # console vindt. BVG_INSTALL_DIR is vereist (default is %ProgramData%).
