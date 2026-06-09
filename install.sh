@@ -16,6 +16,9 @@
 #   BVG_TRANSPORT      transport / connection identifier (optional, server
 #                      derives from the join-token)
 #   BVG_DOMAIN         optional metadata, stored in install.env for reference
+#   BVG_PORTABLE       1/true → service-loze install (geen launchd/systemd-user
+#                      agent, geen self-update-timer); start zelf met `bvg daemon`.
+#                      Gelijk aan de --portable vlag.
 #
 # Installs Node.js (if missing), downloads the bvg bundle, places a
 # launcher script in /usr/local/bin/bvg (or ~/.local/bin), and
@@ -26,6 +29,14 @@ set -euo pipefail
 REPO="appfabriek/bvg"
 INSTALL_PREFIX="${BVG_PREFIX:-/usr/local}"
 NODE_VERSION="${BVG_NODE_VERSION:-22.11.0}"
+
+# Portable (service-loze) install: installeer + pair, maar GEEN launchd-agent /
+# systemd-user-unit en geen self-update-timer. Starten doe je zelf met
+# `bvg daemon`. Opt-in via BVG_PORTABLE=1 of de --portable vlag; de mac/linux-
+# install is sowieso al user-level (geen sudo).
+PORTABLE=0
+case "${BVG_PORTABLE:-}" in 1|true|yes) PORTABLE=1 ;; esac
+for _a in "$@"; do [ "$_a" = "--portable" ] && PORTABLE=1; done
 
 err()  { printf "\033[31m%s\033[0m\n" "$1" >&2; }
 say()  { printf "\033[36m%s\033[0m\n" "$1"; }
@@ -183,7 +194,14 @@ if [ -n "$HAS_TOKEN" ]; then
   fi
 fi
 
-# Install system service when paired.
+# Install system service when paired (tenzij portable).
+if [ "$PAIRED" = "1" ] && [ "$PORTABLE" = "1" ]; then
+  done_ "portable (service-loze) install — geen launchd/systemd-user agent, geen self-update-timer"
+  say "starten:  bvg daemon       (of: $BIN_DIR/bvg daemon)"
+  say "config:   $CONFIG_DIR"
+  say "geen auto-start: draai 'bvg daemon' zelf wanneer je wilt"
+  exit 0
+fi
 if [ "$PAIRED" = "1" ]; then
   case "$OS" in
     linux)
