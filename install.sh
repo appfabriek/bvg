@@ -100,6 +100,33 @@ curl -fsSL -o "$BIN" "$BASE_URL/$ASSET"
 chmod +x "$BIN"
 done_ "bvg installed to $BIN"
 
+# --- 3b. Put `bvg` on PATH -----------------------------------------------
+# Symlink the binary into a PATH dir so `bvg ...` works from any shell. Prefer
+# /usr/local/bin when writable (already on PATH everywhere); otherwise
+# ~/.local/bin, adding it to the shell rc files if it isn't on PATH yet.
+if [ -w /usr/local/bin ] 2>/dev/null; then
+  LINK_DIR="/usr/local/bin"
+else
+  LINK_DIR="$HOME/.local/bin"
+  mkdir -p "$LINK_DIR"
+fi
+if ln -sf "$BIN" "$LINK_DIR/bvg" 2>/dev/null; then
+  done_ "linked $LINK_DIR/bvg -> $BIN"
+  case ":$PATH:" in
+    *":$LINK_DIR:"*) ;;
+    *)
+      for rc in "$HOME/.profile" "$HOME/.zshrc" "$HOME/.bashrc"; do
+        { [ "$rc" = "$HOME/.profile" ] || [ -e "$rc" ]; } || continue
+        grep -qs "added by bvg installer" "$rc" 2>/dev/null && continue
+        printf '\n# added by bvg installer\nexport PATH="%s:$PATH"\n' "$LINK_DIR" >> "$rc" 2>/dev/null || true
+      done
+      say "added $LINK_DIR to PATH (open a new shell, or: export PATH=\"$LINK_DIR:\$PATH\")"
+      ;;
+  esac
+else
+  say "note: could not put bvg on PATH; invoke it as $BIN"
+fi
+
 # --- 4. Enroll (one-time, redeem the join token) -- or skip (anonymous) --
 CREDENTIALS="${BVG_CREDENTIALS:-$DIR/credentials.json}"
 export BVG_CREDENTIALS="$CREDENTIALS"

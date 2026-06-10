@@ -1,65 +1,53 @@
 #!/usr/bin/env bash
-# bvg uninstaller for macOS and Linux (mirror of uninstall.ps1 for Windows).
+# bvg uninstaller for macOS and Linux (Dart wire-client).
 #
 # Usage:
 #   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/uninstall.sh | bash
 #
-# Or, if bvg is already installed locally:
-#   bvg-uninstall            # if a launcher was placed; otherwise run this file
-#   bash uninstall.sh
+# If `bvg` is on PATH you can equivalently run: `bvg uninstall`.
 #
 # Options (flags or env vars):
-#   --keep-files   / BVG_KEEP_FILES=1   keep config + credentials (~/.config/bvg)
-#   --no-unpair    / BVG_NO_UNPAIR=1    skip server-side deregister (bvg unpair)
+#   --keep-files / BVG_KEEP_FILES=1   keep ~/.bvg (binary + credentials)
 #
 # Removes, for the current user:
-#   - launchd agents (macOS) / systemd-user units (Linux): bvg + bvg-update
-#   - the launcher (bvg) and lib dir (bundled Node + bvg.js)
-#   - config + credentials (unless --keep-files)
-# By default it first runs `bvg unpair` so the client deregisters at bvgeert
-# and won't linger under /admin/clients.
+#   - the service: launchd agent nl.bvgeert.bvg (macOS) / systemd-user
+#     bvg.service (Linux), plus any legacy com.appfabriek.bvg* agents
+#   - the PATH symlink (/usr/local/bin/bvg or ~/.local/bin/bvg)
+#   - the install dir ~/.bvg (binary + credentials), unless --keep-files
 set -euo pipefail
 
-err()   { printf "\033[31m%s\033[0m\n" "$1" >&2; }
 say()   { printf "\033[36m%s\033[0m\n" "$1"; }
 done_() { printf "\033[32m%s\033[0m\n" "$1"; }
 
 KEEP_FILES="${BVG_KEEP_FILES:-0}"
-NO_UNPAIR="${BVG_NO_UNPAIR:-0}"
 for arg in "$@"; do
   case "$arg" in
     --keep-files) KEEP_FILES=1 ;;
-    --no-unpair)  NO_UNPAIR=1 ;;
     -h|--help)    grep '^#[^!]' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
-    *) err "unknown option: $arg"; exit 1 ;;
+    *) printf "unknown option: %s\n" "$arg" >&2; exit 1 ;;
   esac
 done
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bvg"
+INSTALL_DIR="${BVG_INSTALL_DIR:-$HOME/.bvg}"
 
-# --- 1. Deregister at the server (best-effort) ---------------------------
-if [ "$NO_UNPAIR" != "1" ] && command -v bvg >/dev/null 2>&1; then
-  say "afmelden bij de server (bvg unpair)..."
-  bvg unpair 2>/dev/null || say "WARN: unpair niet gelukt — verwijder de client zo nodig in /admin/clients"
-fi
-
-# --- 2. Stop + remove the service definitions ----------------------------
+# --- 1. Stop + remove the service ----------------------------------------
 case "$(uname -s)" in
   Darwin)
-    for label in com.appfabriek.bvg com.appfabriek.bvg-update; do
+    for label in nl.bvgeert.bvg com.appfabriek.bvg com.appfabriek.bvg-update; do
       plist="$HOME/Library/LaunchAgents/${label}.plist"
       if [ -f "$plist" ]; then
         launchctl unload "$plist" 2>/dev/null || true
         launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
         rm -f "$plist"
-        done_ "launchd-agent verwijderd: $label"
+        done_ "removed launchd agent: $label"
       fi
     done
     ;;
   Linux)
+    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+    export XDG_RUNTIME_DIR
     UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl --user disable --now bvg-update.timer 2>/dev/null || true
       systemctl --user disable --now bvg.service 2>/dev/null || true
     fi
     removed=0
@@ -67,36 +55,35 @@ case "$(uname -s)" in
       if [ -f "$UNIT_DIR/$unit" ]; then rm -f "$UNIT_DIR/$unit"; removed=1; fi
     done
     if command -v systemctl >/dev/null 2>&1; then systemctl --user daemon-reload 2>/dev/null || true; fi
-    [ "$removed" = "1" ] && done_ "systemd-user units verwijderd: bvg.service + bvg-update.{service,timer}"
+    [ "$removed" = "1" ] && done_ "removed systemd-user unit: bvg.service"
     ;;
-  *) say "onbekend OS ($(uname -s)) — alleen bestanden worden opgeruimd" ;;
+  *) say "unknown OS ($(uname -s)) - only files will be cleaned up" ;;
 esac
 
-# --- 3. Remove launcher + lib dir (both possible prefixes) ---------------
-# /usr/local kan root vereisen; ~/.local niet. sudo alleen waar nodig en
-# beschikbaar.
-maybe_sudo() {
+# --- 2. Remove the PATH symlink ------------------------------------------
+maybe_sudo_rm() {
   local target="$1"
-  if [ -e "$target" ] && [ ! -w "$(dirname "$target")" ] && command -v sudo >/dev/null 2>&1; then
-    sudo rm -rf "$target"
+  [ -e "$target" ] || [ -L "$target" ] || return 0
+  if [ -w "$(dirname "$target")" ]; then
+    rm -f "$target"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo rm -f "$target"
   else
-    rm -rf "$target"
+    say "note: could not remove $target (needs root); remove it manually"
+    return 0
   fi
+  done_ "removed PATH symlink: $target"
 }
-for prefix in /usr/local "$HOME/.local"; do
-  if [ -e "$prefix/bin/bvg" ] || [ -e "$prefix/lib/bvg" ]; then
-    maybe_sudo "$prefix/bin/bvg"
-    maybe_sudo "$prefix/lib/bvg"
-    done_ "verwijderd: $prefix/bin/bvg + $prefix/lib/bvg"
-  fi
-done
+maybe_sudo_rm /usr/local/bin/bvg
+maybe_sudo_rm "$HOME/.local/bin/bvg"
 
-# --- 4. Config + credentials ---------------------------------------------
+# --- 3. Remove the install dir (binary + credentials) --------------------
 if [ "$KEEP_FILES" = "1" ]; then
-  say "config + credentials behouden: $CONFIG_DIR"
-elif [ -d "$CONFIG_DIR" ]; then
-  rm -rf "$CONFIG_DIR"
-  done_ "config + credentials verwijderd: $CONFIG_DIR"
+  say "keeping files: $INSTALL_DIR"
+elif [ -d "$INSTALL_DIR" ]; then
+  rm -rf "$INSTALL_DIR"
+  done_ "removed: $INSTALL_DIR"
 fi
 
-done_ "bvg uninstall voltooid"
+done_ "bvg uninstall complete"
+say "note: this client may still show (offline) under /admin/clients - remove it there to fully deregister."

@@ -153,6 +153,14 @@ if ($curl) {
 if (-not (Test-Path $ExePath)) { Fail "bvg.exe not found after download" }
 Done "bvg.exe installed to $ExePath"
 
+# Put bvg.exe on PATH (Machine) so `bvg ...` works from any shell. We are
+# elevated here, so the Machine scope is writable.
+$machinePath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+if (($machinePath -split ';') -notcontains $InstallDir) {
+  [Environment]::SetEnvironmentVariable("PATH", ("$machinePath;$InstallDir").TrimStart(';'), "Machine")
+  Done "added $InstallDir to Machine PATH (open a new shell to pick it up)"
+}
+
 # --- 5. Enroll (one-time, redeem the join token) -- or skip (anonymous) --
 $env:BVG_CREDENTIALS = $CredentialsPath
 
