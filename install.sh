@@ -107,16 +107,52 @@ export BVG_ANON_BOOTSTRAP_URL
 export BVG_TRANSPORT
 
 if [ -n "${BVG_JOIN_TOKEN:-}" ]; then
-  say "enrolling with bvgeert (transport=$BVG_TRANSPORT)..."
-  "$BIN" enroll \
-    --token "$BVG_JOIN_TOKEN" \
-    --bootstrap "$BVG_ANON_BOOTSTRAP_URL" \
-    --transport "$BVG_TRANSPORT" \
-    --hostname "$(hostname)"
-  done_ "enrolled; credentials at $CREDENTIALS"
+  if [ -f "$CREDENTIALS" ] && grep -q '"client_id"' "$CREDENTIALS" 2>/dev/null; then
+    # Idempotent re-install: existing credentials carry an Ed25519 keypair that
+    # is already registered server-side. Re-enrolling would mint a NEW client
+    # but re-send the SAME public key, which the server rejects (duplicate key)
+    # -> auth fails. So reuse the existing identity instead.
+    say "existing credentials found at $CREDENTIALS -> reusing (skip enroll)"
+    say "to force a fresh enroll, remove $CREDENTIALS first"
+  else
+    say "enrolling with bvgeert (transport=$BVG_TRANSPORT)..."
+    "$BIN" enroll \
+      --token "$BVG_JOIN_TOKEN" \
+      --bootstrap "$BVG_ANON_BOOTSTRAP_URL" \
+      --transport "$BVG_TRANSPORT" \
+      --hostname "$(hostname)"
+    done_ "enrolled; credentials at $CREDENTIALS"
+  fi
 else
   say "no token -> installing in anonymous (pre-enroll) mode; enroll later with: bvg enroll --token <jt> --bootstrap $BVG_ANON_BOOTSTRAP_URL --transport $BVG_TRANSPORT --hostname $(hostname)"
 fi
+
+# --- 4a. Remove any legacy (pre-Dart) bvg install -------------------------
+# Older clients ran a Node bvg under ~/.local/lib/bvg (Linux, via a systemd
+# user unit) or a launchd agent com.appfabriek.bvg (macOS). Left in place the
+# legacy systemd unit crash-loops and fights the Dart service for the same
+# name; remove it. The NEW mac agent is nl.bvgeert.bvg, so wiping the old
+# com.appfabriek.* namespace is safe.
+case "$OS" in
+  Linux)
+    if [ -d "$HOME/.local/lib/bvg" ] || [ -x "$HOME/.local/bin/bvg" ]; then
+      say "removing legacy Node bvg install..."
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop bvg.service 2>/dev/null || true
+        systemctl --user disable bvg.service 2>/dev/null || true
+      fi
+      rm -rf "$HOME/.local/lib/bvg" "$HOME/.local/bin/bvg"
+    fi
+    ;;
+  Darwin)
+    for legacy in "$HOME"/Library/LaunchAgents/com.appfabriek.bvg*.plist; do
+      [ -f "$legacy" ] || continue
+      say "removing legacy launchd agent $(basename "$legacy")..."
+      launchctl unload "$legacy" 2>/dev/null || true
+      rm -f "$legacy"
+    done
+    ;;
+esac
 
 # --- 4b. No-service mode: stop before touching any service ---------------
 # The daemon auto-selects: enrolled creds -> full agent; not enrolled ->
@@ -188,18 +224,31 @@ Environment=BVG_TRANSPORT=$BVG_TRANSPORT
 [Install]
 WantedBy=default.target
 EOF
-    # systemctl --user needs a session/user bus. On headless boxes without one
-    # it fails; don't break the install, just tell the operator how to run it.
-    if systemctl --user show-environment >/dev/null 2>&1; then
+    # systemctl --user needs a user bus. A headless server reached over SSH has
+    # no graphical session, hence no bus -> the service would never start or
+    # survive logout. Enable lingering (systemd spawns a persistent user
+    # manager at boot) and point at its runtime dir, then wait for the bus.
+    # Falls back to a manual run-command only if there's no systemd at all.
+    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+    export XDG_RUNTIME_DIR
+    if command -v loginctl >/dev/null 2>&1; then
+      loginctl enable-linger "$(id -un)" 2>/dev/null || true
+    fi
+    bus_ok=0
+    for _ in 1 2 3 4 5; do
+      if systemctl --user show-environment >/dev/null 2>&1; then bus_ok=1; break; fi
+      sleep 1
+    done
+    if [ "$bus_ok" = "1" ]; then
       systemctl --user daemon-reload
       systemctl --user enable --now bvg.service
       SERVICE_DESC="systemd user unit bvg.service (status: systemctl --user status bvg)"
       done_ "systemd user service running: bvg.service"
     else
-      say "systemctl --user is unavailable (no session bus) - unit written to $UNIT"
+      say "systemctl --user is unavailable (no user bus) - unit written to $UNIT"
       say "start the daemon manually with:"
       say "  BVG_CREDENTIALS=\"$CREDENTIALS\" BVG_ANON_BOOTSTRAP_URL=\"$BVG_ANON_BOOTSTRAP_URL\" BVG_TRANSPORT=\"$BVG_TRANSPORT\" \"$BIN\" daemon"
-      say "or enable lingering + the unit once a user bus exists:"
+      say "or, once a user bus exists:"
       say "  loginctl enable-linger \"\$USER\" && systemctl --user enable --now bvg.service"
       SERVICE_DESC="manual: BVG_CREDENTIALS=\"$CREDENTIALS\" BVG_ANON_BOOTSTRAP_URL=\"$BVG_ANON_BOOTSTRAP_URL\" BVG_TRANSPORT=\"$BVG_TRANSPORT\" \"$BIN\" daemon"
     fi
