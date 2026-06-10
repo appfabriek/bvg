@@ -1,281 +1,118 @@
 #!/usr/bin/env bash
-# bvg installer for macOS and Linux.
+# bvg installer for macOS and Linux (Dart wire-client).
 #
-# Usage:
-#   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/install.sh | bash
+# Downloads the self-contained `bvg` Dart binary from the latest release,
+# enrolls it against the bvgeert transport over Azure using a one-time
+# join-token, and installs a user-level service that runs `bvg daemon`.
 #
-# One-shot install + pair (recommended — the bvgeert admin UI generates
-# this line for you):
+# Usage (the bvg1 proxy snippet / bvgeert admin UI generates this line):
 #   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/install.sh \
-#     | BVG_JOIN_TOKEN=jt_xxx BVG_BVGEERT_HOST=bvgeert.example bash
+#     | BVG_JOIN_TOKEN=jt_xxx \
+#       BVG_ANON_BOOTSTRAP_URL=https://bvg1.example/anon \
+#       BVG_TRANSPORT=my-connection bash
 #
-# Env vars (auto-pair triggers when JOIN_TOKEN + a route are both present):
-#   BVG_JOIN_TOKEN     one-time pre-approved join token (jt_…)
-#   BVG_BVGEERT_HOST   bvgeert hostname for direct HTTPS+WSS route (preferred)
-#   BVG_AZURE_HUB      Azure Web PubSub WSS URL (fallback for restricted networks)
-#   BVG_TRANSPORT      transport / connection identifier (optional, server
-#                      derives from the join-token)
-#   BVG_DOMAIN         optional metadata, stored in install.env for reference
-#   BVG_PORTABLE       1/true → service-loze install (geen launchd/systemd-user
-#                      agent, geen self-update-timer); start zelf met `bvg daemon`.
-#                      Gelijk aan de --portable vlag.
+# Required env vars:
+#   BVG_JOIN_TOKEN          one-time join token (jt_...)
+#   BVG_ANON_BOOTSTRAP_URL  bvg1 anon-access endpoint; the client uses it to
+#                           obtain anonymous Azure access URLs
+#   BVG_TRANSPORT           transport / connection identifier
 #
-# Installs Node.js (if missing), downloads the bvg bundle, places a
-# launcher script in /usr/local/bin/bvg (or ~/.local/bin), and
-# attempts to install a system service (launchd on macOS, systemd-user on
-# Linux). Auto-pair runs in the foreground so you see the result.
+# Optional env vars:
+#   BVG_BVGEERT_HOST        bvgeert hostname (informational, may be present)
+#   BVG_AZURE_HUB           Azure Web PubSub hub (informational, may be present)
+#   BVG_INSTALL_DIR         install dir (default: $HOME/.bvg)
+#   BVG_INSTALL_BASE_URL    release asset base URL
+#                           (default: github.com/appfabriek/bvg latest)
+#   BVG_CREDENTIALS         credentials path (default: <install-dir>/credentials.json)
 set -euo pipefail
 
-REPO="appfabriek/bvg"
-INSTALL_PREFIX="${BVG_PREFIX:-/usr/local}"
-NODE_VERSION="${BVG_NODE_VERSION:-22.11.0}"
+BASE_URL="${BVG_INSTALL_BASE_URL:-https://github.com/appfabriek/bvg/releases/latest/download}"
 
-# Portable (service-loze) install: installeer + pair, maar GEEN launchd-agent /
-# systemd-user-unit en geen self-update-timer. Starten doe je zelf met
-# `bvg daemon`. Opt-in via BVG_PORTABLE=1 of de --portable vlag; de mac/linux-
-# install is sowieso al user-level (geen sudo).
-PORTABLE=0
-case "${BVG_PORTABLE:-}" in 1|true|yes) PORTABLE=1 ;; esac
-for _a in "$@"; do [ "$_a" = "--portable" ] && PORTABLE=1; done
-
-err()  { printf "\033[31m%s\033[0m\n" "$1" >&2; }
-say()  { printf "\033[36m%s\033[0m\n" "$1"; }
+err()   { printf "\033[31m%s\033[0m\n" "$1" >&2; }
+say()   { printf "\033[36m%s\033[0m\n" "$1"; }
 done_() { printf "\033[32m%s\033[0m\n" "$1"; }
 
-require_curl() { command -v curl >/dev/null 2>&1 || { err "curl not found"; exit 1; }; }
-require_curl
+command -v curl >/dev/null 2>&1 || { err "curl not found"; exit 1; }
 
-sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print tolower($1)}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print tolower($1)}'
-  else
-    err "no sha256sum or shasum found - cannot verify downloads"
-    exit 1
-  fi
-}
+# --- 1. Require config env-vars ------------------------------------------
+missing=0
+[ -n "${BVG_JOIN_TOKEN:-}" ]         || { err "BVG_JOIN_TOKEN is required";         missing=1; }
+[ -n "${BVG_ANON_BOOTSTRAP_URL:-}" ] || { err "BVG_ANON_BOOTSTRAP_URL is required"; missing=1; }
+[ -n "${BVG_TRANSPORT:-}" ]          || { err "BVG_TRANSPORT is required";          missing=1; }
+if [ "$missing" = "1" ]; then
+  err "set BVG_JOIN_TOKEN, BVG_ANON_BOOTSTRAP_URL and BVG_TRANSPORT and re-run."
+  exit 1
+fi
 
-verify_sha256() {
-  local file="$1"
-  local sha_url="$2"
-  local expected actual
+# --- 2. Detect platform and map to a release asset -----------------------
+OS="$(uname -s)"
+MACHINE="$(uname -m)"
+case "$MACHINE" in
+  x86_64|amd64)        ARCH="x64";;
+  arm64|aarch64)       ARCH="arm64";;
+  *) err "unsupported architecture: $MACHINE"; exit 1;;
+esac
 
-  expected="$(curl -fsSL --max-time 30 "$sha_url" | awk '{print tolower($1)}')"
-  if [ -z "$expected" ]; then
-    err "empty checksum from $sha_url"
-    exit 1
-  fi
-
-  actual="$(sha256_file "$file")"
-  if [ "$actual" != "$expected" ]; then
-    err "sha256 mismatch for $(basename "$file")"
-    err "downloaded=$actual expected=$expected"
-    exit 1
-  fi
-}
-
-# --- Pre-flight checks ---------------------------------------------------
-# Disk space (need ~250MB for Node bundle + Node-runtime download fallback)
-case "$(uname -s)" in
-  Linux|Darwin)
-    free_mb="$(df -m "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -n "${free_mb:-}" ] && [ "$free_mb" -lt 250 ]; then
-      err "less than 250 MB free in $HOME — install needs ~200 MB"; exit 1
-    fi
+case "$OS" in
+  Linux)
+    ASSET="bvg-linux-x64"
+    ;;
+  Darwin)
+    case "$ARCH" in
+      arm64) ASSET="bvg-macos-arm64";;
+      x64)   ASSET="bvg-macos-x64";;
+      *)     err "unsupported macOS architecture: $MACHINE"; exit 1;;
+    esac
+    ;;
+  *)
+    err "unsupported OS: $OS"; exit 1
     ;;
 esac
-# GitHub reachability — warn (don't fail) so corp proxies don't break things
-if ! curl -fsS --max-time 5 -o /dev/null https://github.com/ 2>/dev/null; then
-  say "WARN: github.com not reachable in 5s — download likely to fail"
-fi
+say "platform: $OS/$MACHINE -> asset $ASSET"
 
-# Pick install prefix that's writable (drop to ~/.local if needed).
-if [ ! -w "$INSTALL_PREFIX/bin" ] && [ "$INSTALL_PREFIX" = "/usr/local" ]; then
-  INSTALL_PREFIX="$HOME/.local"
-  mkdir -p "$INSTALL_PREFIX/bin"
-fi
-BIN_DIR="$INSTALL_PREFIX/bin"
-LIB_DIR="$INSTALL_PREFIX/lib/bvg"
-mkdir -p "$BIN_DIR" "$LIB_DIR"
+# --- 3. Download the binary ----------------------------------------------
+DIR="${BVG_INSTALL_DIR:-$HOME/.bvg}"
+BIN="$DIR/bvg"
+mkdir -p "$DIR"
 
-# Detect platform.
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH="$(uname -m)"
-case "$OS-$ARCH" in
-  linux-x86_64)  NODE_TARBALL="node-v${NODE_VERSION}-linux-x64";;
-  linux-aarch64) NODE_TARBALL="node-v${NODE_VERSION}-linux-arm64";;
-  darwin-arm64)  NODE_TARBALL="node-v${NODE_VERSION}-darwin-arm64";;
-  darwin-x86_64) NODE_TARBALL="node-v${NODE_VERSION}-darwin-x64";;
-  *) err "unsupported platform $OS-$ARCH"; exit 1;;
-esac
+say "downloading $ASSET to $BIN..."
+# curl-downloaded binaries do NOT get the macOS Gatekeeper quarantine xattr,
+# so no codesign/notarization dance is needed for this CLI path.
+curl -fsSL -o "$BIN" "$BASE_URL/$ASSET"
+chmod +x "$BIN"
+done_ "bvg installed to $BIN"
 
-# Install Node locally if not already on PATH.
-NODE_BIN=""
-if command -v node >/dev/null 2>&1; then
-  NODE_BIN="$(command -v node)"
-  say "using existing node: $NODE_BIN ($(node --version))"
-else
-  NODE_DIR="$LIB_DIR/node-v${NODE_VERSION}"
-  if [ ! -x "$NODE_DIR/bin/node" ]; then
-    say "downloading Node.js ${NODE_VERSION} for $OS-$ARCH..."
-    NODE_ARCHIVE="$LIB_DIR/${NODE_TARBALL}.tar.xz"
-    NODE_SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"
-    curl -fsSL -o "$NODE_ARCHIVE" "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}.tar.xz"
-    NODE_EXPECTED_HASH="$(curl -fsSL "$NODE_SHASUMS_URL" | awk -v file="${NODE_TARBALL}.tar.xz" '$2 == file {print tolower($1)}')"
-    NODE_ACTUAL_HASH="$(sha256_file "$NODE_ARCHIVE")"
-    if [ -z "$NODE_EXPECTED_HASH" ] || [ "$NODE_ACTUAL_HASH" != "$NODE_EXPECTED_HASH" ]; then
-      err "sha256 mismatch for ${NODE_TARBALL}.tar.xz"
-      err "downloaded=$NODE_ACTUAL_HASH expected=$NODE_EXPECTED_HASH"
-      exit 1
-    fi
-    tar -xJ -C "$LIB_DIR" -f "$NODE_ARCHIVE"
-    rm -f "$NODE_ARCHIVE"
-    mv "$LIB_DIR/${NODE_TARBALL}" "$NODE_DIR"
-  fi
-  NODE_BIN="$NODE_DIR/bin/node"
-fi
+# --- 4. Enroll (one-time, redeem the join token) -------------------------
+CREDENTIALS="${BVG_CREDENTIALS:-$DIR/credentials.json}"
+export BVG_CREDENTIALS="$CREDENTIALS"
 
-# Download the bundled CLI from the latest release and require checksum match.
-say "downloading bvg bundle..."
-BUNDLE_URL="https://github.com/${REPO}/releases/latest/download/bvg.js"
-BUNDLE_SHA_URL="https://github.com/${REPO}/releases/latest/download/bvg.js.sha256"
-BUNDLE_TMP="$(mktemp -t bvg.XXXXXXXX.js)"
-curl -fsSL -o "$BUNDLE_TMP" "$BUNDLE_URL"
-verify_sha256 "$BUNDLE_TMP" "$BUNDLE_SHA_URL"
-mv "$BUNDLE_TMP" "$LIB_DIR/bvg.js"
+say "enrolling with bvgeert (transport=$BVG_TRANSPORT)..."
+"$BIN" enroll \
+  --token "$BVG_JOIN_TOKEN" \
+  --bootstrap "$BVG_ANON_BOOTSTRAP_URL" \
+  --transport "$BVG_TRANSPORT" \
+  --hostname "$(hostname)"
+done_ "enrolled; credentials at $CREDENTIALS"
 
-# Wrapper script.
-cat >"$BIN_DIR/bvg" <<EOF
-#!/usr/bin/env bash
-exec "$NODE_BIN" "$LIB_DIR/bvg.js" "\$@"
-EOF
-chmod +x "$BIN_DIR/bvg"
-
-done_ "bvg installed to $BIN_DIR/bvg"
-
-# --- Self-update bookkeeping --------------------------------------------
-# Pull the updater script + a version.txt sibling for later semver-compare.
-UPDATER_URL="https://github.com/${REPO}/releases/latest/download/bvg-update.sh"
-UPDATER_SHA_URL="https://github.com/${REPO}/releases/latest/download/bvg-update.sh.sha256"
-VERSION_URL="https://github.com/${REPO}/releases/latest/download/version.txt"
-UPDATER_TMP="$(mktemp -t bvg-update.XXXXXXXX.sh)"
-curl -fsSL -o "$UPDATER_TMP" --max-time 30 "$UPDATER_URL"
-verify_sha256 "$UPDATER_TMP" "$UPDATER_SHA_URL"
-mv "$UPDATER_TMP" "$LIB_DIR/bvg-update.sh"
-chmod +x "$LIB_DIR/bvg-update.sh"
-curl -fsSL -o "$LIB_DIR/version.txt" --max-time 30 "$VERSION_URL" 2>/dev/null || \
-  printf '0.0.0' > "$LIB_DIR/version.txt"
-
-# Decide pairing route from env-vars.
-HAS_TOKEN="${BVG_JOIN_TOKEN:-}"
-PAIRED=0
-
-# Schrijf install.env ALTIJD (ook zonder token) zodat een latere `bvg enroll`
-# de host/route uit dit bestand kan lezen en de gebruiker alleen het token hoeft
-# te geven (#369). install.env staat naast credentials op de XDG-config-locatie.
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bvg"
-mkdir -p "$CONFIG_DIR"
-CONFIG_ENV="$CONFIG_DIR/install.env"
-{
-  [ -n "${BVG_DOMAIN:-}" ]       && echo "BVG_DOMAIN=$BVG_DOMAIN"
-  [ -n "${BVG_BVGEERT_HOST:-}" ] && echo "BVG_BVGEERT_HOST=$BVG_BVGEERT_HOST"
-  [ -n "${BVG_AZURE_HUB:-}" ]    && echo "BVG_AZURE_HUB=$BVG_AZURE_HUB"
-  [ -n "${BVG_TRANSPORT:-}" ]    && echo "BVG_TRANSPORT=$BVG_TRANSPORT"
-  true  # zorg dat het blok niet faalt onder set -e als alle vars leeg zijn
-} > "$CONFIG_ENV"
-chmod 600 "$CONFIG_ENV"
-
-if [ -n "$HAS_TOKEN" ]; then
-  if [ -n "${BVG_BVGEERT_HOST:-}" ]; then
-    say "pairing with bvgeert directly at $BVG_BVGEERT_HOST..."
-    "$BIN_DIR/bvg" join --host "$BVG_BVGEERT_HOST" --token "$HAS_TOKEN" \
-      ${BVG_TRANSPORT:+--transport "$BVG_TRANSPORT"} && PAIRED=1 || PAIRED=0
-  elif [ -n "${BVG_AZURE_HUB:-}" ]; then
-    TRANSPORT="${BVG_TRANSPORT:-default}"
-    say "pairing with bvgeert via Azure (transport=$TRANSPORT)..."
-    "$BIN_DIR/bvg" join --hub "$BVG_AZURE_HUB" --transport "$TRANSPORT" --token "$HAS_TOKEN" \
-      && PAIRED=1 || PAIRED=0
-  fi
-fi
-
-# Install system service when paired (tenzij portable).
-if [ "$PAIRED" = "1" ] && [ "$PORTABLE" = "1" ]; then
-  done_ "portable (service-loze) install — geen launchd/systemd-user agent, geen self-update-timer"
-  say "starten:  bvg daemon       (of: $BIN_DIR/bvg daemon)"
-  say "config:   $CONFIG_DIR"
-  say "geen auto-start: draai 'bvg daemon' zelf wanneer je wilt"
-  exit 0
-fi
-if [ "$PAIRED" = "1" ]; then
-  case "$OS" in
-    linux)
-      UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-      mkdir -p "$UNIT_DIR"
-      cat >"$UNIT_DIR/bvg.service" <<EOF
-[Unit]
-Description=BvGeert transport daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$BIN_DIR/bvg daemon
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-      # --- Daily self-update timer (Linux systemd-user) ---
-      if [ -x "$LIB_DIR/bvg-update.sh" ]; then
-        cat >"$UNIT_DIR/bvg-update.service" <<EOF
-[Unit]
-Description=BvGeert transport daemon — self-update check
-
-[Service]
-Type=oneshot
-ExecStart=$LIB_DIR/bvg-update.sh
-EOF
-        cat >"$UNIT_DIR/bvg-update.timer" <<EOF
-[Unit]
-Description=Run bvg self-update daily
-
-[Timer]
-OnBootSec=15min
-OnUnitActiveSec=1d
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-      fi
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user daemon-reload || true
-        systemctl --user enable --now bvg.service || true
-        done_ "systemd-user service draait: bvg.service"
-        if [ -f "$UNIT_DIR/bvg-update.timer" ]; then
-          systemctl --user enable --now bvg-update.timer || true
-          done_ "self-update timer: bvg-update.timer (daily, +random delay)"
-        fi
-      else
-        say "systemd niet beschikbaar — unit-bestand staat in $UNIT_DIR"
-      fi
-      ;;
-    darwin)
-      PLIST="$HOME/Library/LaunchAgents/com.appfabriek.bvg.plist"
-      mkdir -p "$(dirname "$PLIST")"
-      cat >"$PLIST" <<EOF
+# --- 5. Install a user-level service running `bvg daemon` -----------------
+SERVICE_DESC=""
+case "$OS" in
+  Darwin)
+    PLIST="$HOME/Library/LaunchAgents/nl.bvgeert.bvg.plist"
+    mkdir -p "$(dirname "$PLIST")"
+    cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.appfabriek.bvg</string>
+  <key>Label</key><string>nl.bvgeert.bvg</string>
   <key>ProgramArguments</key><array>
-    <string>$BIN_DIR/bvg</string>
+    <string>$BIN</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>BVG_CREDENTIALS</key><string>$CREDENTIALS</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/bvg.log</string>
@@ -283,53 +120,55 @@ EOF
 </dict>
 </plist>
 EOF
-      launchctl unload "$PLIST" 2>/dev/null || true
-      launchctl load "$PLIST"
-      done_ "launchd-agent geladen: com.appfabriek.bvg"
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+    SERVICE_DESC="launchd agent nl.bvgeert.bvg (load: launchctl load $PLIST)"
+    done_ "launchd agent loaded: nl.bvgeert.bvg"
+    ;;
+  Linux)
+    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    UNIT="$UNIT_DIR/bvg.service"
+    mkdir -p "$UNIT_DIR"
+    cat >"$UNIT" <<EOF
+[Unit]
+Description=BvGeert transport daemon
+After=network-online.target
+Wants=network-online.target
 
-      # --- Daily self-update launchd-agent (macOS) ---
-      if [ -x "$LIB_DIR/bvg-update.sh" ]; then
-        UPDATE_PLIST="$HOME/Library/LaunchAgents/com.appfabriek.bvg-update.plist"
-        # Random hour between 3-4am to spread API load across clients.
-        UH=$((3 + RANDOM % 2))
-        UM=$((RANDOM % 60))
-        cat >"$UPDATE_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.appfabriek.bvg-update</string>
-  <key>ProgramArguments</key><array>
-    <string>$LIB_DIR/bvg-update.sh</string>
-  </array>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>$UH</integer>
-    <key>Minute</key><integer>$UM</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>/tmp/bvg-update.log</string>
-  <key>StandardErrorPath</key><string>/tmp/bvg-update.err</string>
-</dict>
-</plist>
+[Service]
+Type=simple
+ExecStart=$BIN daemon
+Restart=always
+RestartSec=5
+Environment=BVG_CREDENTIALS=$CREDENTIALS
+
+[Install]
+WantedBy=default.target
 EOF
-        launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
-        launchctl load "$UPDATE_PLIST"
-        done_ "self-update launchd-agent geladen: com.appfabriek.bvg-update (daily at ${UH}:$(printf '%02d' $UM))"
-      fi
-      ;;
-  esac
-  exit 0
-fi
-
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *) say "Add $BIN_DIR to your PATH: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    # systemctl --user needs a session/user bus. On headless boxes without one
+    # it fails; don't break the install, just tell the operator how to run it.
+    if systemctl --user show-environment >/dev/null 2>&1; then
+      systemctl --user daemon-reload
+      systemctl --user enable --now bvg.service
+      SERVICE_DESC="systemd user unit bvg.service (status: systemctl --user status bvg)"
+      done_ "systemd user service running: bvg.service"
+    else
+      say "systemctl --user is unavailable (no session bus) - unit written to $UNIT"
+      say "start the daemon manually with:"
+      say "  BVG_CREDENTIALS=\"$CREDENTIALS\" \"$BIN\" daemon"
+      say "or enable lingering + the unit once a user bus exists:"
+      say "  loginctl enable-linger \"\$USER\" && systemctl --user enable --now bvg.service"
+      SERVICE_DESC="manual: BVG_CREDENTIALS=\"$CREDENTIALS\" \"$BIN\" daemon"
+    fi
+    ;;
 esac
 
-done_ "geen token → geïnstalleerd (offline, geen service); host/route bewaard in $CONFIG_ENV"
-say "enroll later met: bvg enroll --token <jt_xxx>"
-say "  (host/route komt uit install.env; daarna 'bvg daemon' of her-run install met token voor de service)"
-say ""
-say "alternatief — direct met een token pairen:"
-say "  bvg join --host <bvgeert-host> --token <jt_xxx>"
-say "  of (Azure-fallback): bvg join --hub <wss-url> --transport <id> --token <jt_xxx>"
+# --- 6. Success summary ---------------------------------------------------
+done_ "installation complete"
+echo ""
+echo "binary:       $BIN"
+echo "credentials:  $CREDENTIALS"
+echo "transport:    $BVG_TRANSPORT"
+echo "service:      $SERVICE_DESC"
+echo ""
+echo "status:       BVG_CREDENTIALS=\"$CREDENTIALS\" \"$BIN\" status"
