@@ -4,8 +4,11 @@
   bvg installer for Windows (Dart wire-client).
 
   Downloads the self-contained bvg.exe Dart binary from the latest release,
-  enrolls it against the bvgeert transport over Azure using a one-time
-  join-token, and installs a Windows service that runs `bvg daemon`.
+  optionally enrolls it against the bvgeert transport over Azure using a
+  one-time join-token, and installs a Windows service that runs `bvg launch`
+  (which applies any pending self-update then runs the daemon). Without a join
+  token the client installs in anonymous (pre-enroll) mode and can be enrolled
+  later.
 
 .DESCRIPTION
   One-liner install (the bvg1 proxy snippet / bvgeert admin UI generates this):
@@ -16,15 +19,19 @@
     iwr https://github.com/appfabriek/bvg/releases/latest/download/install.ps1 -UseBasicParsing | iex
 
   The script self-elevates via UAC, downloads bvg-windows-x64.exe, enrolls
-  with the join-token, persists BVG_CREDENTIALS as a machine env var, and
-  registers a Windows service via WinSW.
+  with the join-token (if one is given), persists BVG_CREDENTIALS as a machine
+  env var, and registers a Windows service via WinSW.
 
   Required env vars:
-    BVG_JOIN_TOKEN          one-time join token (jt_...)
     BVG_ANON_BOOTSTRAP_URL  bvg1 anon-access endpoint (anonymous Azure URLs)
     BVG_TRANSPORT           transport / connection identifier
 
   Optional env vars:
+    BVG_JOIN_TOKEN          one-time join token (jt_...); if set, enroll now,
+                            otherwise install in anonymous (pre-enroll) mode
+    BVG_NO_SERVICE          1/true => download (+ enroll if token) but do not
+                            install or start the service; print the manual
+                            run-command instead (also via -NoService switch)
     BVG_BVGEERT_HOST        bvgeert hostname (informational)
     BVG_AZURE_HUB           Azure Web PubSub hub (informational)
     BVG_INSTALL_DIR         install dir (default: $env:ProgramData\bvg)
@@ -34,7 +41,8 @@
 
 [CmdletBinding()]
 param(
-  [string]$ServiceName = "bvg"
+  [string]$ServiceName = "bvg",
+  [switch]$NoService
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,12 +62,23 @@ $BaseUrl = if ($env:BVG_INSTALL_BASE_URL) { $env:BVG_INSTALL_BASE_URL } `
 $WinSwUrl = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW.NET4.exe"
 
 # --- 1. Resolve + require config env-vars --------------------------------
+# BVG_JOIN_TOKEN is OPTIONAL (tokenless = anonymous pre-enroll mode). The
+# anonymous daemon still needs the bootstrap url + transport, so those stay
+# required.
 $JoinToken    = $env:BVG_JOIN_TOKEN
 $BootstrapUrl = $env:BVG_ANON_BOOTSTRAP_URL
 $Transport    = $env:BVG_TRANSPORT
 
+# Resolve no-service mode: -NoService switch or BVG_NO_SERVICE env var.
+$NoServiceMode = [bool]$NoService
+if (-not $NoServiceMode -and $env:BVG_NO_SERVICE) {
+  $NoServiceMode = @("1", "true", "yes") -contains $env:BVG_NO_SERVICE.ToLower()
+}
+# Mirror the switch into the env var so it survives UAC self-elevation (the
+# elevated session is launched via `iwr | iex`, which cannot receive -NoService).
+if ($NoServiceMode) { $env:BVG_NO_SERVICE = "1" }
+
 $missing = @()
-if (-not $JoinToken)    { $missing += "BVG_JOIN_TOKEN" }
 if (-not $BootstrapUrl) { $missing += "BVG_ANON_BOOTSTRAP_URL" }
 if (-not $Transport)    { $missing += "BVG_TRANSPORT" }
 if ($missing.Count -gt 0) {
@@ -78,7 +97,7 @@ if (-not $IsAdmin) {
   # Forward the env-vars the elevated session needs.
   $envFwd = @(
     "BVG_JOIN_TOKEN", "BVG_ANON_BOOTSTRAP_URL", "BVG_TRANSPORT",
-    "BVG_BVGEERT_HOST", "BVG_AZURE_HUB", "BVG_INSTALL_DIR",
+    "BVG_NO_SERVICE", "BVG_BVGEERT_HOST", "BVG_AZURE_HUB", "BVG_INSTALL_DIR",
     "BVG_INSTALL_BASE_URL", "BVG_CREDENTIALS"
   ) | ForEach-Object {
     $v = [Environment]::GetEnvironmentVariable($_)
@@ -134,23 +153,42 @@ if ($curl) {
 if (-not (Test-Path $ExePath)) { Fail "bvg.exe not found after download" }
 Done "bvg.exe installed to $ExePath"
 
-# --- 5. Enroll (one-time, redeem the join token) -------------------------
+# --- 5. Enroll (one-time, redeem the join token) -- or skip (anonymous) --
 $env:BVG_CREDENTIALS = $CredentialsPath
-if (Test-Path -LiteralPath $CredentialsPath) {
-  Remove-Item -LiteralPath $CredentialsPath -Force -ErrorAction SilentlyContinue
+
+if ($JoinToken) {
+  if (Test-Path -LiteralPath $CredentialsPath) {
+    Remove-Item -LiteralPath $CredentialsPath -Force -ErrorAction SilentlyContinue
+  }
+  Say "enrolling with bvgeert (transport=$Transport)..."
+  $enrollArgs = @(
+    "enroll",
+    "--token", $JoinToken,
+    "--bootstrap", $BootstrapUrl,
+    "--transport", $Transport,
+    "--hostname", $env:COMPUTERNAME
+  )
+  $ec = (Start-Process -FilePath $ExePath -ArgumentList $enrollArgs -Wait -NoNewWindow -PassThru).ExitCode
+  if ($ec -ne 0) { Fail "enroll failed (exit $ec)" }
+  Done "enrolled; credentials at $CredentialsPath"
+} else {
+  Say "no token -> installing in anonymous (pre-enroll) mode; enroll later with: bvg enroll --token <jt> --bootstrap $BootstrapUrl --transport $Transport --hostname $env:COMPUTERNAME"
 }
 
-Say "enrolling with bvgeert (transport=$Transport)..."
-$enrollArgs = @(
-  "enroll",
-  "--token", $JoinToken,
-  "--bootstrap", $BootstrapUrl,
-  "--transport", $Transport,
-  "--hostname", $env:COMPUTERNAME
-)
-$ec = (Start-Process -FilePath $ExePath -ArgumentList $enrollArgs -Wait -NoNewWindow -PassThru).ExitCode
-if ($ec -ne 0) { Fail "enroll failed (exit $ec)" }
-Done "enrolled; credentials at $CredentialsPath"
+# --- 5b. No-service mode: stop before touching any service ---------------
+# The daemon auto-selects: enrolled creds -> full agent; not enrolled ->
+# anonymous pre-enroll daemon. Run it manually with the env vars below.
+if ($NoServiceMode) {
+  Done "download complete; service NOT installed (BVG_NO_SERVICE)"
+  Write-Host ""
+  Write-Host "run the daemon manually with:"
+  Write-Host "  `$env:BVG_CREDENTIALS=`"$CredentialsPath`"; `$env:BVG_ANON_BOOTSTRAP_URL=`"$BootstrapUrl`"; `$env:BVG_TRANSPORT=`"$Transport`"; & `"$ExePath`" daemon"
+  Write-Host ""
+  Write-Host "binary:       $ExePath"
+  Write-Host "credentials:  $CredentialsPath"
+  Write-Host "transport:    $Transport"
+  exit 0
+}
 
 # --- 6. Register a Windows service via WinSW -----------------------------
 $WinSwExe = Join-Path $InstallDir "bvg-svc.exe"
@@ -175,11 +213,13 @@ $xml = @"
   <name>BvGeert transport daemon</name>
   <description>BvGeert transport client (bvg daemon)</description>
   <executable>$ExePath</executable>
-  <arguments>daemon</arguments>
+  <arguments>launch</arguments>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="5 sec"/>
   <log mode="roll"/>
   <env name="BVG_CREDENTIALS" value="$CredentialsPath"/>
+  <env name="BVG_ANON_BOOTSTRAP_URL" value="$BootstrapUrl"/>
+  <env name="BVG_TRANSPORT" value="$Transport"/>
 </service>
 "@
 Set-Content -Path $WinSwXml -Value $xml -Encoding ASCII

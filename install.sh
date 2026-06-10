@@ -2,8 +2,11 @@
 # bvg installer for macOS and Linux (Dart wire-client).
 #
 # Downloads the self-contained `bvg` Dart binary from the latest release,
-# enrolls it against the bvgeert transport over Azure using a one-time
-# join-token, and installs a user-level service that runs `bvg daemon`.
+# optionally enrolls it against the bvgeert transport over Azure using a
+# one-time join-token, and installs a user-level service that runs `bvg launch`
+# (which applies any pending self-update then runs the daemon). Without a join
+# token the client installs in anonymous (pre-enroll) mode and can be enrolled
+# later.
 #
 # Usage (the bvg1 proxy snippet / bvgeert admin UI generates this line):
 #   curl -fsSL https://github.com/appfabriek/bvg/releases/latest/download/install.sh \
@@ -12,12 +15,16 @@
 #       BVG_TRANSPORT=my-connection bash
 #
 # Required env vars:
-#   BVG_JOIN_TOKEN          one-time join token (jt_...)
 #   BVG_ANON_BOOTSTRAP_URL  bvg1 anon-access endpoint; the client uses it to
 #                           obtain anonymous Azure access URLs
 #   BVG_TRANSPORT           transport / connection identifier
 #
 # Optional env vars:
+#   BVG_JOIN_TOKEN          one-time join token (jt_...); if set, enroll now,
+#                           otherwise install in anonymous (pre-enroll) mode
+#   BVG_NO_SERVICE          1/true => download (+ enroll if token) but do not
+#                           install or start the service; print the manual
+#                           run-command instead (also via --no-service arg)
 #   BVG_BVGEERT_HOST        bvgeert hostname (informational, may be present)
 #   BVG_AZURE_HUB           Azure Web PubSub hub (informational, may be present)
 #   BVG_INSTALL_DIR         install dir (default: $HOME/.bvg)
@@ -34,13 +41,24 @@ done_() { printf "\033[32m%s\033[0m\n" "$1"; }
 
 command -v curl >/dev/null 2>&1 || { err "curl not found"; exit 1; }
 
+# --- 0. Parse args / resolve no-service flag -----------------------------
+NO_SERVICE=0
+case "${BVG_NO_SERVICE:-}" in 1|true|TRUE|True|yes|YES) NO_SERVICE=1;; esac
+for arg in "$@"; do
+  case "$arg" in
+    --no-service) NO_SERVICE=1;;
+  esac
+done
+
 # --- 1. Require config env-vars ------------------------------------------
+# BVG_JOIN_TOKEN is OPTIONAL (tokenless = anonymous pre-enroll mode).
+# The anonymous daemon still needs the bootstrap url + transport, so those
+# stay required.
 missing=0
-[ -n "${BVG_JOIN_TOKEN:-}" ]         || { err "BVG_JOIN_TOKEN is required";         missing=1; }
 [ -n "${BVG_ANON_BOOTSTRAP_URL:-}" ] || { err "BVG_ANON_BOOTSTRAP_URL is required"; missing=1; }
 [ -n "${BVG_TRANSPORT:-}" ]          || { err "BVG_TRANSPORT is required";          missing=1; }
 if [ "$missing" = "1" ]; then
-  err "set BVG_JOIN_TOKEN, BVG_ANON_BOOTSTRAP_URL and BVG_TRANSPORT and re-run."
+  err "set BVG_ANON_BOOTSTRAP_URL and BVG_TRANSPORT and re-run."
   exit 1
 fi
 
@@ -82,19 +100,40 @@ curl -fsSL -o "$BIN" "$BASE_URL/$ASSET"
 chmod +x "$BIN"
 done_ "bvg installed to $BIN"
 
-# --- 4. Enroll (one-time, redeem the join token) -------------------------
+# --- 4. Enroll (one-time, redeem the join token) -- or skip (anonymous) --
 CREDENTIALS="${BVG_CREDENTIALS:-$DIR/credentials.json}"
 export BVG_CREDENTIALS="$CREDENTIALS"
+export BVG_ANON_BOOTSTRAP_URL
+export BVG_TRANSPORT
 
-say "enrolling with bvgeert (transport=$BVG_TRANSPORT)..."
-"$BIN" enroll \
-  --token "$BVG_JOIN_TOKEN" \
-  --bootstrap "$BVG_ANON_BOOTSTRAP_URL" \
-  --transport "$BVG_TRANSPORT" \
-  --hostname "$(hostname)"
-done_ "enrolled; credentials at $CREDENTIALS"
+if [ -n "${BVG_JOIN_TOKEN:-}" ]; then
+  say "enrolling with bvgeert (transport=$BVG_TRANSPORT)..."
+  "$BIN" enroll \
+    --token "$BVG_JOIN_TOKEN" \
+    --bootstrap "$BVG_ANON_BOOTSTRAP_URL" \
+    --transport "$BVG_TRANSPORT" \
+    --hostname "$(hostname)"
+  done_ "enrolled; credentials at $CREDENTIALS"
+else
+  say "no token -> installing in anonymous (pre-enroll) mode; enroll later with: bvg enroll --token <jt> --bootstrap $BVG_ANON_BOOTSTRAP_URL --transport $BVG_TRANSPORT --hostname $(hostname)"
+fi
 
-# --- 5. Install a user-level service running `bvg daemon` -----------------
+# --- 4b. No-service mode: stop before touching any service ---------------
+# The daemon auto-selects: enrolled creds -> full agent; not enrolled ->
+# anonymous pre-enroll daemon. Run it manually with the env vars below.
+if [ "$NO_SERVICE" = "1" ]; then
+  done_ "download complete; service NOT installed (BVG_NO_SERVICE)"
+  echo ""
+  echo "run the daemon manually with:"
+  echo "  BVG_CREDENTIALS=\"$CREDENTIALS\" BVG_ANON_BOOTSTRAP_URL=\"$BVG_ANON_BOOTSTRAP_URL\" BVG_TRANSPORT=\"$BVG_TRANSPORT\" \"$BIN\" daemon"
+  echo ""
+  echo "binary:       $BIN"
+  echo "credentials:  $CREDENTIALS"
+  echo "transport:    $BVG_TRANSPORT"
+  exit 0
+fi
+
+# --- 5. Install a user-level service running `bvg launch` -----------------
 SERVICE_DESC=""
 case "$OS" in
   Darwin)
@@ -108,10 +147,12 @@ case "$OS" in
   <key>Label</key><string>nl.bvgeert.bvg</string>
   <key>ProgramArguments</key><array>
     <string>$BIN</string>
-    <string>daemon</string>
+    <string>launch</string>
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>BVG_CREDENTIALS</key><string>$CREDENTIALS</string>
+    <key>BVG_ANON_BOOTSTRAP_URL</key><string>$BVG_ANON_BOOTSTRAP_URL</string>
+    <key>BVG_TRANSPORT</key><string>$BVG_TRANSPORT</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -137,10 +178,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN daemon
+ExecStart=$BIN launch
 Restart=always
 RestartSec=5
 Environment=BVG_CREDENTIALS=$CREDENTIALS
+Environment=BVG_ANON_BOOTSTRAP_URL=$BVG_ANON_BOOTSTRAP_URL
+Environment=BVG_TRANSPORT=$BVG_TRANSPORT
 
 [Install]
 WantedBy=default.target
@@ -155,10 +198,10 @@ EOF
     else
       say "systemctl --user is unavailable (no session bus) - unit written to $UNIT"
       say "start the daemon manually with:"
-      say "  BVG_CREDENTIALS=\"$CREDENTIALS\" \"$BIN\" daemon"
+      say "  BVG_CREDENTIALS=\"$CREDENTIALS\" BVG_ANON_BOOTSTRAP_URL=\"$BVG_ANON_BOOTSTRAP_URL\" BVG_TRANSPORT=\"$BVG_TRANSPORT\" \"$BIN\" daemon"
       say "or enable lingering + the unit once a user bus exists:"
       say "  loginctl enable-linger \"\$USER\" && systemctl --user enable --now bvg.service"
-      SERVICE_DESC="manual: BVG_CREDENTIALS=\"$CREDENTIALS\" \"$BIN\" daemon"
+      SERVICE_DESC="manual: BVG_CREDENTIALS=\"$CREDENTIALS\" BVG_ANON_BOOTSTRAP_URL=\"$BVG_ANON_BOOTSTRAP_URL\" BVG_TRANSPORT=\"$BVG_TRANSPORT\" \"$BIN\" daemon"
     fi
     ;;
 esac
