@@ -25,8 +25,6 @@
 #   BVG_NO_SERVICE          1/true => download (+ enroll if token) but do not
 #                           install or start the service; print the manual
 #                           run-command instead (also via --no-service arg)
-#   BVG_BVGEERT_HOST        bvgeert hostname (informational, may be present)
-#   BVG_AZURE_HUB           Azure Web PubSub hub (informational, may be present)
 #   BVG_INSTALL_DIR         install dir (default: $HOME/.bvg)
 #   BVG_INSTALL_BASE_URL    release asset base URL
 #                           (default: github.com/appfabriek/bvg latest)

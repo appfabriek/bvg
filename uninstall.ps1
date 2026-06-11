@@ -70,6 +70,28 @@ if ($machinePath) {
   }
 }
 
+# --- 2b. Remove the Private-Trust signing chain --------------------------
+# Pull the chain we trusted at install time back out of the machine stores.
+# Read the bundled p7b/root from InstallDir BEFORE the dir is deleted below.
+$chainCerts = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+$p7b = Join-Path $InstallDir "bvg-codesign-chain.p7b"
+$rootCer = Join-Path $InstallDir "bvg-codesign-root.cer"
+try {
+  if (Test-Path $p7b)         { $chainCerts.Import($p7b) }
+  elseif (Test-Path $rootCer) { $chainCerts.Import($rootCer) }
+} catch { Say "WARN: could not read code-signing chain: $($_.Exception.Message)" }
+foreach ($cert in $chainCerts) {
+  $storeName = if ($cert.Subject -eq $cert.Issuer) { "Root" } else { "CA" }
+  try {
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+    $store.Open("ReadWrite")
+    $found = $store.Certificates.Find("FindByThumbprint", $cert.Thumbprint, $false)
+    foreach ($c in $found) { $store.Remove($c) }
+    $store.Close()
+    if ($found.Count -gt 0) { Done "removed code-signing cert from ${storeName}" }
+  } catch { Say "WARN: could not remove code-signing cert from ${storeName}: $($_.Exception.Message)" }
+}
+
 # --- 3. Remove the install dir -------------------------------------------
 if (-not $KeepFiles -and (Test-Path $InstallDir)) {
   Say "removing $InstallDir..."

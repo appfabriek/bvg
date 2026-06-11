@@ -32,8 +32,6 @@
     BVG_NO_SERVICE          1/true => download (+ enroll if token) but do not
                             install or start the service; print the manual
                             run-command instead (also via -NoService switch)
-    BVG_BVGEERT_HOST        bvgeert hostname (informational)
-    BVG_AZURE_HUB           Azure Web PubSub hub (informational)
     BVG_INSTALL_DIR         install dir (default: $env:ProgramData\bvg)
     BVG_INSTALL_BASE_URL    release asset base URL
     BVG_CREDENTIALS         credentials path (default: <install-dir>\credentials.json)
@@ -56,6 +54,56 @@ $PSNativeCommandUseErrorActionPreference = $false
 function Say($msg)  { Write-Host $msg -ForegroundColor Cyan }
 function Done($msg) { Write-Host $msg -ForegroundColor Green }
 function Fail($msg) { Write-Host $msg -ForegroundColor Red; exit 1 }
+
+# Private Trust: install the bundled signing-CA chain into the machine stores
+# (root -> LocalMachine\Root, intermediates -> LocalMachine\CA) so Windows can
+# validate the leaf-only Authenticode signature, also offline / as SYSTEM.
+# Idempotent on thumbprint. Prefers the chain bundle; falls back to the root.
+function Install-CodeSignChain($Dir) {
+  $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+  $p7b = Join-Path $Dir "bvg-codesign-chain.p7b"
+  $rootCer = Join-Path $Dir "bvg-codesign-root.cer"
+  try {
+    if (Test-Path $p7b)         { $certs.Import($p7b) }
+    elseif (Test-Path $rootCer) { $certs.Import($rootCer) }
+    else                        { return }
+  } catch { Say "WARN: could not read code-signing chain: $($_.Exception.Message)"; return }
+
+  foreach ($cert in $certs) {
+    $storeName = if ($cert.Subject -eq $cert.Issuer) { "Root" } else { "CA" }
+    try {
+      $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+      $store.Open("ReadWrite")
+      if (($store.Certificates.Find("FindByThumbprint", $cert.Thumbprint, $false)).Count -eq 0) {
+        $store.Add($cert)
+        Done "trusted code-signing cert in ${storeName}: $($cert.Subject)"
+      }
+      $store.Close()
+    } catch { Say "WARN: could not install code-signing cert in ${storeName}: $($_.Exception.Message)" }
+  }
+}
+
+# Verify bvg.exe is Authenticode-signed by CN=bvgeert.nl. When a
+# signature-required.txt marker is present we REFUSE an unsigned / invalid /
+# wrong-signer binary (fail-closed); otherwise we only warn (legacy/unsigned).
+function Assert-BvgExeSignature($Path, [bool]$Required) {
+  $expectedCN = "bvgeert.nl"
+  $sig = Get-AuthenticodeSignature -FilePath $Path
+  if ($sig.Status -eq "Valid") {
+    $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+    if ($subject -notmatch "CN=$([regex]::Escape($expectedCN))(,|$)") {
+      if ($Required) { Fail "bvg.exe signed by unexpected issuer '$subject' (expected CN=$expectedCN) - refusing to install" }
+      Say "WARN: bvg.exe signed by unexpected issuer '$subject'"
+      return
+    }
+    Done "bvg.exe signature valid: $subject"
+    return
+  }
+  if ($Required) {
+    Fail "bvg.exe Authenticode signature is $($sig.Status) - refusing to install an unsigned/invalid binary (signature-required.txt present)"
+  }
+  Say "WARN: bvg.exe Authenticode signature is $($sig.Status) - continuing (no signature-required.txt marker)"
+}
 
 $BaseUrl = if ($env:BVG_INSTALL_BASE_URL) { $env:BVG_INSTALL_BASE_URL } `
            else { "https://github.com/appfabriek/bvg/releases/latest/download" }
@@ -97,7 +145,7 @@ if (-not $IsAdmin) {
   # Forward the env-vars the elevated session needs.
   $envFwd = @(
     "BVG_JOIN_TOKEN", "BVG_ANON_BOOTSTRAP_URL", "BVG_TRANSPORT",
-    "BVG_NO_SERVICE", "BVG_BVGEERT_HOST", "BVG_AZURE_HUB", "BVG_INSTALL_DIR",
+    "BVG_NO_SERVICE", "BVG_INSTALL_DIR",
     "BVG_INSTALL_BASE_URL", "BVG_CREDENTIALS"
   ) | ForEach-Object {
     $v = [Environment]::GetEnvironmentVariable($_)
@@ -152,6 +200,25 @@ if ($curl) {
 }
 if (-not (Test-Path $ExePath)) { Fail "bvg.exe not found after download" }
 Done "bvg.exe installed to $ExePath"
+
+# --- 4a. Trust the signing chain + verify the binary --------------------
+# Fetch the Private-Trust signing chain + the signature-required.txt marker,
+# trust the chain, then verify bvg.exe. With the marker present an invalid
+# signature is fatal (fail-closed); without it (older release) we only warn.
+$ChainPath  = Join-Path $InstallDir "bvg-codesign-chain.p7b"
+$RootCer    = Join-Path $InstallDir "bvg-codesign-root.cer"
+$MarkerPath = Join-Path $InstallDir "signature-required.txt"
+foreach ($pair in @(
+    @("bvg-codesign-chain.p7b", $ChainPath),
+    @("bvg-codesign-root.cer",  $RootCer),
+    @("signature-required.txt", $MarkerPath))) {
+  try {
+    if ($curl) { & curl.exe -fsSL -o $pair[1] "$BaseUrl/$($pair[0])" 2>$null }
+    else       { Invoke-WebRequest -Uri "$BaseUrl/$($pair[0])" -OutFile $pair[1] -UseBasicParsing }
+  } catch { }
+}
+Install-CodeSignChain $InstallDir
+Assert-BvgExeSignature $ExePath ([bool](Test-Path $MarkerPath))
 
 # Put bvg.exe on PATH (Machine) so `bvg ...` works from any shell. We are
 # elevated here, so the Machine scope is writable.
