@@ -1,15 +1,11 @@
 # bvg
 
+> **Huidige transport-client.** Dit is de actieve install- en release-repo.
+> De oudere client [`appfabriek/bvg-deamon`](https://github.com/appfabriek/bvg-deamon) is **archived** en mag niet meer worden geïnstalleerd (historische referentie alleen).
+
 Public download repo for the **bvg** transport client (a single self-contained
 **Dart** binary). Releases worden hier gehost; ontwikkeling gebeurt in
 [`appfabriek/bvgeert`](https://github.com/appfabriek/bvgeert) onder `clients/bvg/`.
-
-De client verbindt met het bvgeert-transportnetwerk over **Azure Web PubSub** en
-spreekt het verenigde wire-protocol. Hij draait als service (launchd /
-systemd-user / Windows-service) en handelt fleet-control af (`command.status_query`,
-`command.shell`). De client **update zichzelf** over de wire (`update.check` ->
-download nieuwe release-binary -> atomic swap -> herstart), ook als hij nog
-anoniem (pre-enroll) is.
 
 ## Aanbevolen: install via de admin-one-liner
 
