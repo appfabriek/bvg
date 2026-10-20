@@ -5,11 +5,11 @@
 
 Public download repo for the **bvg** transport client (a single self-contained
 **Dart** binary). Releases worden hier gehost; ontwikkeling gebeurt in
-[`appfabriek/bvgeert`](https://github.com/appfabriek/bvgeert) onder `clients/bvg/`.
+[`appfabriek/dok`](https://github.com/appfabriek/dok) onder `packages/bvg/` (dok heette tot 11 okt 2026 `bvgeert`).
 
 ## Aanbevolen: install via de admin-one-liner
 
-In bvgeert: **admin -> connectie -> "client toevoegen"** geeft een regel die je op
+In dok: **admin -> connectie -> "client toevoegen"** geeft een regel die je op
 de doelmachine plakt (via de installer-proxy `bvg1.azurewebsites.net`):
 
 ```bash
